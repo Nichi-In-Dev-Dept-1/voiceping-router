@@ -388,6 +388,9 @@ export default class Client extends EventEmitter {
       case MessageType.USER_REMOVE:
         this.removeFromGroup(msg.toId);
         break;
+      case MessageType.USER_REMOVE_ALL:
+        this.emit("message", msg, this);
+        break;
       case MessageType.DELIVERED:
         break;
       case MessageType.READ:

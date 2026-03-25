@@ -111,6 +111,8 @@ class Server implements IServer {
     if (msg.channelType === ChannelType.GROUP) {
       if (msg.messageType === MessageType.CONNECTION) {
         this.handleConnectionMessage(msg);
+      } else if (msg.messageType === MessageType.USER_REMOVE_ALL) {
+        this.removeFromAllGroups(msg.fromId);
       } else {
         this.sendMessageToGroup(msg);
       }
@@ -239,6 +241,33 @@ class Server implements IServer {
         if (!echo && recipientId.toString() === userId.toString()) { continue; }
         this.sendDataToUser(data, recipientId);
       }
+    });
+  }
+
+  private removeFromAllGroups(this: Server, userId: numberOrString): void {
+    Redis.getGroupsOfUser(userId, (err, groupIds) => {
+      if (err) {
+        logger.error(`Redis.getGroupsOfUser id ${userId} ERR ${err}`);
+        return;
+      }
+
+      const groups = groupIds || [];
+      Redis.removeUserFromAllGroups(userId, (removeErr) => {
+        if (removeErr) {
+          logger.error(`Redis.removeUserFromAllGroups id ${userId} ERR ${removeErr}`);
+          return;
+        }
+
+        groups.forEach((groupId) => {
+          Redis.getUsersInsideGroup(groupId, (groupErr, userIds) => {
+            if (groupErr) {
+              logger.error(`Redis.getUsersInsideGroup groupId ${groupId} ERR ${groupErr}`);
+              return;
+            }
+            States.setUsersInsideGroup(groupId, userIds);
+          });
+        });
+      });
     });
   }
 
