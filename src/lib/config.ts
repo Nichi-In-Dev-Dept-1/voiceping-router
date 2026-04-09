@@ -6,6 +6,11 @@ const config = {
     busyTimeout: Number(process.env.GROUP_BUSY_TIMEOUT) || (95 * 1000),
     inspectInterval: Number(process.env.GROUP_INSPECT_INTERVAL) || (60 * 1000)
   },
+  instance: {
+    heartbeatInterval: Number(process.env.INSTANCE_HEARTBEAT_INTERVAL) || (60 * 1000),
+    id: process.env.INSTANCE_ID || process.env.HOSTNAME || ("voiceping-router-" + process.pid),
+    presenceTtl: Number(process.env.INSTANCE_PRESENCE_TTL) || (5 * 60)
+  },
   message: {
     maximumDuration: Number(process.env.MAXIMUM_AUDIO_DURATION) || (90 * 1000),
     maximumIdleDuration: Number(process.env.MAXIMUM_IDLE_DURATION) || (3 * 1000)

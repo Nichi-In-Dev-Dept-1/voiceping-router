@@ -8,6 +8,7 @@ import * as WebSocket from "ws";
 import ChannelType = require("./channeltype");
 import Client, { IClients } from "./client";
 import config = require("./config");
+import Distributed = require("./distributed");
 
 import logger = require("./logger");
 import MessageType = require("./messagetype");
@@ -38,6 +39,8 @@ class Server implements IServer {
   private clients: IClients = {};
   private sockets = {};
   private deviceTokens = {};
+  private instanceHeartbeat: NodeJS.Timer = null;
+  private instanceId: string = config.instance.id;
   private wss = null;
   private verify = null;
 
@@ -68,29 +71,23 @@ class Server implements IServer {
     }
 
     this.wss.on("connection", this.handleWssConnection.bind(this));
+
+    Distributed.subscribeToInstance(this.instanceId, this.handleDistributedUserMessage);
+    this.periodicRefreshUserInstances();
   }
 
   // IServer Implementation
 
   public sendMessageToUser(this: Server, msg: IMessage) {
     packer.pack(msg, (err, packed) => {
-      const client = this.clients[msg.toId];
-      if (!client) {
-        if (msg.messageType === MessageType.AUDIO) {
-          debug(`sendMessageToUser type AUDIO NOT-FOUND id ${msg.toId} ${JSON.stringify(msg)}`);
-        } else {
-          debug(`sendMessageToUser type NON-AUDIO NOT-FOUND id ${msg.toId} ${JSON.stringify(msg)}`);
-        }
-        return;
-      }
-      client.send(packed);
+      this.sendPackedDataToUser(packed, msg.toId, msg);
     });
   }
 
   public sendMessageToGroup(this: Server, msg: IMessage) {
     logger.info(`sendMessageToGroup from: ${msg.fromId} to: ${msg.toId} messageType: ${msg.messageType}`);
     packer.pack(msg, (err, packed) => {
-      this.sendDataFromUserToGroup(packed, msg.fromId, msg.toId);
+      this.sendDataFromUserToGroup(packed, msg.fromId, msg.toId, false, msg);
     });
   }
 
@@ -102,6 +99,13 @@ class Server implements IServer {
     client.removeListener("unregister", this.handleClientUnregister);
     delete this.clients[clientId];
     delete this.sockets[clientId];
+    Distributed.clearUserInstance(clientId, this.instanceId, (err, cleared) => {
+      if (err) {
+        logger.error(`Distributed.clearUserInstance id ${clientId} instance ${this.instanceId} ERR ${err}`);
+      } else if (cleared) {
+        debug(`Distributed.clearUserInstance id ${clientId} instance ${this.instanceId}`);
+      }
+    });
     logger.info(`UNREGISTERED id ${clientId} clients ${Object.keys(this.clients).length}` +
                 ` sockets ${Object.keys(this.sockets).length} wss ${this.wss.clients.size}`);
   }
@@ -133,6 +137,7 @@ class Server implements IServer {
 
     client.registerSocket(socket, key, deviceId);
     this.sockets[id] = socket;
+    this.refreshUserInstance(id);
 
     // tslint:disable-next-line:max-line-length
     logger.info(`REGISTERED id ${client.id} clients ${Object.keys(this.clients).length} readyState ${socket.readyState} ` +
@@ -205,13 +210,12 @@ class Server implements IServer {
    * @private
    *
    */
-  private sendDataToUser(this: Server, data: Buffer, userId: numberOrString) {
-    if (this.clients.hasOwnProperty(userId)) {
-      const client = this.clients[userId];
-      client.send(data);
-    } else {
-      // debug(`sendDataToUser NOT-FOUND id ${userId}`);
-    }
+  private sendDataToUser(this: Server, data: Buffer, userId: numberOrString): boolean {
+    if (!this.clients.hasOwnProperty(userId)) { return false; }
+
+    const client = this.clients[userId];
+    client.send(data);
+    return true;
   }
 
   /**
@@ -226,7 +230,8 @@ class Server implements IServer {
   private sendDataFromUserToGroup(
     this: Server,
     data: Buffer, userId: numberOrString,
-    groupId: numberOrString, echo: boolean = false
+    groupId: numberOrString, echo: boolean = false,
+    msg?: IMessage
   ) {
     States.getUsersInsideGroup(groupId, (err, userIds) => {
       if (err) {
@@ -239,9 +244,85 @@ class Server implements IServer {
       }
       for (const recipientId of userIds) {
         if (!echo && recipientId.toString() === userId.toString()) { continue; }
-        this.sendDataToUser(data, recipientId);
+        this.sendPackedDataToUser(data, recipientId, msg);
       }
     });
+  }
+
+  private sendPackedDataToUser(this: Server, data: Buffer, userId: numberOrString, msg?: IMessage) {
+    if (this.sendDataToUser(data, userId)) { return; }
+
+    if (msg) {
+      this.routeMessageToRemoteUser(userId, msg);
+      return;
+    }
+
+    debug(`sendPackedDataToUser NOT-FOUND id ${userId}`);
+  }
+
+  private routeMessageToRemoteUser(this: Server, userId: numberOrString, msg: IMessage) {
+    Distributed.getUserInstance(userId, (err, instanceId) => {
+      if (err) {
+        logger.error(`Distributed.getUserInstance id ${userId} ERR ${err}`);
+        return;
+      }
+
+      if (!instanceId) {
+        if (msg.messageType === MessageType.AUDIO) {
+          debug(`sendMessageToUser type AUDIO NOT-FOUND id ${userId} ${JSON.stringify(msg)}`);
+        } else {
+          debug(`sendMessageToUser type NON-AUDIO NOT-FOUND id ${userId} ${JSON.stringify(msg)}`);
+        }
+        return;
+      }
+
+      if (instanceId === this.instanceId) {
+        debug(`Distributed.getUserInstance id ${userId} instance ${instanceId} local-instance-no-client`);
+        return;
+      }
+
+      Distributed.publishMessageToInstance(instanceId, userId, msg, (publishErr, receivers) => {
+        if (publishErr) {
+          logger.error(`Distributed.publishMessageToInstance user ${userId} instance ${instanceId} ERR ${publishErr}`);
+          return;
+        }
+
+        debug(`Distributed.publishMessageToInstance user ${userId} instance ${instanceId} receivers ${receivers}`);
+      });
+    });
+  }
+
+  private handleDistributedUserMessage = (userId: numberOrString, msg: IMessage) => {
+    packer.pack(msg, (err, packed) => {
+      if (err) {
+        logger.error(`handleDistributedUserMessage pack ERR ${err}`);
+        return;
+      }
+
+      if (!this.sendDataToUser(packed, userId)) {
+        debug(`handleDistributedUserMessage NOT-FOUND id ${userId} ${JSON.stringify(msg)}`);
+      }
+    });
+  }
+
+  private refreshUserInstance(this: Server, userId: numberOrString) {
+    Distributed.setUserInstance(userId, this.instanceId, (err, succeed) => {
+      if (err) {
+        logger.error(`Distributed.setUserInstance id ${userId} instance ${this.instanceId} ERR ${err}`);
+      } else if (!succeed) {
+        debug(`Distributed.setUserInstance id ${userId} instance ${this.instanceId} failed`);
+      }
+    });
+  }
+
+  private periodicRefreshUserInstances(this: Server) {
+    if (this.instanceHeartbeat || config.instance.heartbeatInterval <= 0) { return; }
+
+    this.instanceHeartbeat = setInterval(() => {
+      Object.keys(this.clients).forEach((clientId) => {
+        this.refreshUserInstance(clientId);
+      });
+    }, config.instance.heartbeatInterval);
   }
 
   private removeFromAllGroups(this: Server, userId: numberOrString): void {
