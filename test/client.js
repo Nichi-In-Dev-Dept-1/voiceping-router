@@ -3,7 +3,7 @@
 var jwt = require("jwt-simple");
 var Ws = require("ws");
 
-var secret = "voiceping2359staging";
+var secret = process.env.SECRET_KEY || "awesomevoiceping";
 
 function connectClient(port, userId, groupId) {
   var user = {

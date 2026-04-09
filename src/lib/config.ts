@@ -14,7 +14,8 @@ const config = {
     name: process.env.NETWORK || "voiceping-lite"
   },
   nodeEnv: process.env.NODE_ENV || "production",
-  pingInterval: Number(process.env.PING_INTERVAL) || (2 * 60 * 1000),
+  pingInterval: Number(process.env.PING_INTERVAL) || (5 * 1000),
+  pingTimeout: Number(process.env.PING_TIMEOUT) || (12 * 1000),
   redis: {
     cleanGroupsAmount: Number(process.env.REDIS_CLEAN_GROUPS_AMOUNT) || 10000,
     cleanInterval: Number(process.env.REDIS_CLEAN_INTERVAL) || (60 * 1000),

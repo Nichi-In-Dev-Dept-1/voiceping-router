@@ -50,6 +50,19 @@ export default class Connection extends EventEmitter {
     }
   }
 
+  public getLastSeenAt(this: Connection) {
+    return this.timestamp;
+  }
+
+  public terminate(this: Connection) {
+    logger.info(`id: ${this.clientId} key: ${this.key} TERMINATE readyState: ${this.socket.readyState}`);
+    try {
+      this.socket.terminate();
+    } catch (exception) {
+      debug(`id ${this.clientId} key ${this.key} TERMINATE ERR ${JSON.stringify(exception)} device ${this.deviceId}`);
+    }
+  }
+
   public send(this: Connection, data: Buffer, msg?: IMessage) {
     if (msg && (msg.messageType === MessageType.LOGIN_DUPLICATED || msg.messageType === MessageType.CONNECTION_ACK)) {
       debug(`id ${this.clientId} SEND readyState: ${this.socket.readyState}, msg: ${JSON.stringify(msg)}`);
@@ -106,6 +119,7 @@ export default class Connection extends EventEmitter {
   }
 
   private handleSocketMessage = (data: Buffer) => {
+    this.timestamp = Date.now();
     debug(`*************************************`);
     debug(`id ${this.clientId} key ${this.key}` +
               ` handleSocketMessage RAW data: ${data.toString()}` +

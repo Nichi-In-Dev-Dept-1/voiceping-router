@@ -17,6 +17,19 @@ var MessageType = VP.MessageType;
 
 var port = 3334;
 
+function waitForMessageType(ws, expectedType, onMatch) {
+  function handler(data) {
+    var decoded = notepack.decode(data);
+    if (decoded[1] !== expectedType) {
+      ws.once("message", handler);
+      return;
+    }
+    onMatch(data, decoded);
+  }
+
+  ws.once("message", handler);
+}
+
 describe("router group messaging busy state flows", function() {
   var server = null;
   var userId1 = "1";
@@ -80,10 +93,8 @@ describe("router group messaging busy state flows", function() {
       if (received) { done(); }
     });
 
-    ws2.once("message", function(data) {
+    waitForMessageType(ws2, MessageType.START, function(data, decoded) {
       expect(data).to.not.be.empty;
-
-      var decoded = notepack.decode(data);
       var channelType = decoded[0];
       expect(channelType).to.be.equal(ChannelType.GROUP);
 
@@ -119,10 +130,8 @@ describe("router group messaging busy state flows", function() {
     var received1 = false;
     var received2 = false;
 
-    ws2.once("message", function(data) {
+    waitForMessageType(ws2, MessageType.AUDIO, function(data, decoded) {
       expect(data).to.not.be.empty;
-
-      var decoded = notepack.decode(data);
       var channelType = decoded[0];
       expect(channelType).to.be.equal(ChannelType.GROUP);
 
@@ -162,10 +171,8 @@ describe("router group messaging busy state flows", function() {
     var message = notepack.encode([ChannelType.GROUP, MessageType.START, from, to, timestamp]);
     ws2.send(message);
 
-    ws2.once("message", function(data) {
+    waitForMessageType(ws2, MessageType.START_FAILED, function(data, decoded) {
       expect(data).to.not.be.empty;
-
-      var decoded = notepack.decode(data);
       var channelType = decoded[0];
       expect(channelType).to.be.equal(ChannelType.GROUP);
 
@@ -177,6 +184,107 @@ describe("router group messaging busy state flows", function() {
       expect(payload).to.be.equal("Busy");
 
       done();
+    });
+  });
+
+  it("should drop audio from non owner while floor is busy", function(done) {
+    var from = userId2;
+    var to = groupId;
+
+    function whitenoise() {
+      var bufferSize = 512;
+      var out = [[], []];
+      for (var i = 0; i < bufferSize; i++) {
+        out[0][i] = [1][i] = Math.random() * 0.25;
+      }
+      return new Buffer(out);
+    }
+
+    var audiobuffer = whitenoise();
+    var message = notepack.encode([ChannelType.GROUP, MessageType.AUDIO, from, to, audiobuffer]);
+
+    var unexpected = function() {
+      done(new Error("non-owner audio should not be broadcast"));
+    };
+
+    ws2.once("message", unexpected);
+    ws3.once("message", unexpected);
+
+    ws2.send(message);
+
+    setTimeout(function() {
+      ws2.removeListener("message", unexpected);
+      ws3.removeListener("message", unexpected);
+      done();
+    }, 300);
+  });
+
+  it("should ignore stop from non owner while current owner is talking", function(done) {
+    var from = userId2;
+    var to = groupId;
+    var timestamp = Date.now();
+
+    ws2.send(notepack.encode([ChannelType.GROUP, MessageType.STOP, from, to, timestamp]));
+
+    setTimeout(function() {
+      ws2.send(notepack.encode([ChannelType.GROUP, MessageType.START, from, to, Date.now()]));
+
+      waitForMessageType(ws2, MessageType.START_FAILED, function(data) {
+        var decoded = notepack.decode(data);
+        expect(decoded[0]).to.be.equal(ChannelType.GROUP);
+        expect(decoded[1]).to.be.equal(MessageType.START_FAILED);
+        expect(decoded[4]).to.be.equal("Busy");
+        done();
+      });
+    }, 150);
+  });
+
+  it("should allow only one winner during a simultaneous start burst", function(done) {
+    var contenders = [ws1, ws2, ws3];
+    var userIds = [userId1, userId2, userId3];
+    var ackCount = 0;
+    var failCount = 0;
+    var expectedFailures = contenders.length - 1;
+    var totalResults = contenders.length;
+    var receivedResults = 0;
+
+    function onResult(decoded) {
+      if (decoded[1] === MessageType.START_ACK) {
+        ackCount += 1;
+      } else if (decoded[1] === MessageType.START_FAILED) {
+        failCount += 1;
+      }
+
+      receivedResults += 1;
+
+      if (receivedResults === totalResults) {
+        expect(ackCount).to.be.equal(1);
+        expect(failCount).to.be.equal(expectedFailures);
+        contenders.forEach(function(ws) {
+          ws.removeListener("message", onMessage);
+        });
+        done();
+      }
+    }
+
+    function onMessage(data) {
+      var decoded = notepack.decode(data);
+      if (decoded[1] !== MessageType.START_ACK && decoded[1] !== MessageType.START_FAILED) {
+        return;
+      }
+      onResult(decoded);
+    }
+
+    contenders.forEach(function(ws, index) {
+      ws.on("message", onMessage);
+
+      ws.send(notepack.encode([
+        ChannelType.GROUP,
+        MessageType.START,
+        userIds[index],
+        groupId,
+        Date.now() + index
+      ]));
     });
   });
 
@@ -268,10 +376,8 @@ describe("router group messaging busy state flows", function() {
       if (received) { done(); }
     });
 
-    ws3.once("message", function(data) {
+    waitForMessageType(ws3, MessageType.START, function(data, decoded) {
       expect(data).to.not.be.empty;
-
-      var decoded = notepack.decode(data);
       var channelType = decoded[0];
       expect(channelType).to.be.equal(ChannelType.GROUP);
 
@@ -307,10 +413,8 @@ describe("router group messaging busy state flows", function() {
     var received1 = false;
     var received2 = false;
 
-    ws1.once("message", function(data) {
+    waitForMessageType(ws1, MessageType.AUDIO, function(data, decoded) {
       expect(data).to.not.be.empty;
-
-      var decoded = notepack.decode(data);
       var channelType = decoded[0];
       expect(channelType).to.be.equal(ChannelType.GROUP);
 
@@ -324,10 +428,8 @@ describe("router group messaging busy state flows", function() {
       if (received2) { done(); }
     });
 
-    ws3.once("message", function(data) {
+    waitForMessageType(ws3, MessageType.AUDIO, function(data, decoded) {
       expect(data).to.not.be.empty;
-
-      var decoded = notepack.decode(data);
       var channelType = decoded[0];
       expect(channelType).to.be.equal(ChannelType.GROUP);
 

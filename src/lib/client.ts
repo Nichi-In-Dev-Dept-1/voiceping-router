@@ -23,9 +23,19 @@ function debug(msg: string) {
 
 const MAXIMUM_IDLE_DURATION: number = config.message.maximumIdleDuration;
 const PING_INTERVAL: number = config.pingInterval;
+const PING_TIMEOUT: number = config.pingTimeout;
 
 interface IConnections {
   [index: string]: Connection;
+}
+
+interface ITextMessageMeta {
+  callId?: string;
+  errorType?: string;
+  membersInCall?: number;
+  textMessageType?: string;
+  translate?: boolean;
+  lang?: string;
 }
 
 export default class Client extends EventEmitter {
@@ -88,6 +98,11 @@ export default class Client extends EventEmitter {
   public unregister(this: Client) {
     clearInterval(this.pingInterval);
     this.pingInterval = null;
+    States.getGroupsWithActiveParticipant(this.id, (err, activeGroups) => {
+      States.removeActiveParticipantFromAllGroups(this.id);
+      States.releaseFloorOwnershipForUser(this.id);
+      this.emit("unregister", this, activeGroups || []);
+    });
     this.closeConnections();
   }
 
@@ -123,7 +138,6 @@ export default class Client extends EventEmitter {
     const connections = Object.keys(this.connections).length;
     if (connections <= 0) {
       this.unregister();
-      this.emit("unregister", this);
       return;
     }
 
@@ -134,7 +148,15 @@ export default class Client extends EventEmitter {
 
   private ping(this: Client) {
     Object.keys(this.connections).forEach((key) => {
-      this.connections[key].ping();
+      const connection = this.connections[key];
+      if (!connection) { return; }
+      const idleTime = Date.now() - connection.getLastSeenAt();
+      if (idleTime > PING_TIMEOUT) {
+        logger.info(`id ${this.id} key ${key} ping timeout after ${idleTime}ms, terminating socket`);
+        connection.terminate();
+        return;
+      }
+      connection.ping();
     });
   }
 
@@ -235,6 +257,26 @@ export default class Client extends EventEmitter {
   private handleStopMessage(this: Client, msg: IMessage) {
     logger.info(`handleStopMessage id ${msg.fromId} to ${msg.toId} messageType ${msg.messageType}`);
 
+    if (msg.channelType === ChannelType.GROUP) {
+      return States.isFloorOwnerOfGroup(msg.toId, msg.fromId, (ownerErr, isOwner) => {
+        if (ownerErr) {
+          debug(`id ${this.id} handleStopMessage owner check err ${ownerErr}`);
+          return;
+        }
+        if (!isOwner) {
+          debug(`id ${this.id} ignoring STOP from non-owner ${msg.fromId} for group ${msg.toId}`);
+          return;
+        }
+        return this.finishStopMessage(msg);
+      });
+    }
+
+    return this.finishStopMessage(msg);
+  }
+
+  private finishStopMessage(this: Client, msg: IMessage) {
+    logger.info(`finishStopMessage id ${msg.fromId} to ${msg.toId} messageType ${msg.messageType}`);
+
     Recorder.stop(msg, (err, messageId, duration) => {
       setTimeout(() => {
         this.acknowledgeStopMessage(msg, messageId);
@@ -253,7 +295,9 @@ export default class Client extends EventEmitter {
 
         States.removeCurrentMessageOfUser(msg.fromId);
         if (msg.channelType === ChannelType.GROUP) {
-          States.removeCurrentMessageOfGroup(msg.toId);
+          States.releaseFloorOfGroup(msg.toId, msg.fromId, () => {
+            States.removeCurrentMessageOfGroup(msg.toId);
+          });
         }
         debug(`id ${this.id} Done removing current message from states`);
         States.getBusyStateOfGroup(msg.toId, (err1, busy) => {
@@ -307,6 +351,8 @@ export default class Client extends EventEmitter {
 
   private handleTextMessage(this: Client, msg: IMessage) {
     Recorder.save(msg, (err, messageId) => {
+      const meta = this.parseTextMessageMeta(msg);
+      this.applyAuthoritativeParticipantCount(msg, meta, () => {
       this.acknowledgeTextMessage(msg, messageId);
 
       let text = msg.payload.toString();
@@ -343,6 +389,7 @@ export default class Client extends EventEmitter {
       }
 
       this.emit("message", msg1, this);
+      });
     });
   }
 
@@ -356,6 +403,58 @@ export default class Client extends EventEmitter {
       payload: "Acknowledged",
       toId: msg.toId
     });
+  }
+
+  private parseTextMessageMeta(this: Client, msg: IMessage): ITextMessageMeta | null {
+    if (!msg.messageId || typeof msg.messageId !== "string") { return null; }
+    try {
+      return JSON.parse(msg.messageId) as ITextMessageMeta;
+    } catch (e) {
+      debug(`id ${this.id} parseTextMessageMeta error ${e}`);
+      return null;
+    }
+  }
+
+  private applyAuthoritativeParticipantCount(
+    this: Client,
+    msg: IMessage,
+    meta: ITextMessageMeta | null,
+    callback: () => void
+  ) {
+    if (msg.channelType !== ChannelType.GROUP || !meta || !meta.textMessageType) {
+      callback();
+      return;
+    }
+
+    const groupId = msg.toId;
+    const senderId = msg.fromId;
+
+    switch (meta.textMessageType) {
+      case "JoinAcknowledgement":
+        States.addUserToActiveCallGroup(senderId, groupId, (err, count) => {
+          meta.membersInCall = count;
+          msg.messageId = JSON.stringify(meta);
+          callback();
+        });
+        return;
+      case "DropCall":
+        States.removeUserFromActiveCallGroup(senderId, groupId, (err, count) => {
+          meta.membersInCall = count;
+          msg.messageId = JSON.stringify(meta);
+          callback();
+        });
+        return;
+      case "CallEndedForAll":
+        States.clearActiveCallGroup(groupId, () => {
+          meta.membersInCall = 0;
+          msg.messageId = JSON.stringify(meta);
+          callback();
+        });
+        return;
+      default:
+        callback();
+        return;
+    }
   }
 
   // GROUP MESSAGE HANDLERS
@@ -406,11 +505,21 @@ export default class Client extends EventEmitter {
 
   private handleGroupAudioMessage(this: Client, msg: IMessage) {
     logger.info(`handleGroupAudioMessage id ${msg.fromId} to ${msg.toId} messageType ${msg.messageType}`);
-    States.updateAudioTimeOfGroup(msg.toId);
-    Recorder.resume(msg, (err, messageId, duration) => {
-      if (err) { debug(`id: ${this.id} recorder.resume: err: ${err} messageId: ${messageId}` +
-                       ` duration: ${duration}`); }
-      this.emit("message", msg, this);
+    States.isFloorOwnerOfGroup(msg.toId, msg.fromId, (ownerErr, isOwner) => {
+      if (ownerErr) {
+        debug(`id: ${this.id} handleGroupAudioMessage owner check err: ${ownerErr}`);
+        return;
+      }
+      if (!isOwner) {
+        debug(`id: ${this.id} dropping group AUDIO from non-owner ${msg.fromId} for group ${msg.toId}`);
+        return;
+      }
+      States.refreshFloorOfGroup(msg.toId, msg.fromId);
+      Recorder.resume(msg, (err, messageId, duration) => {
+        if (err) { debug(`id: ${this.id} recorder.resume: err: ${err} messageId: ${messageId}` +
+                         ` duration: ${duration}`); }
+        this.emit("message", msg, this);
+      });
     });
   }
 
@@ -419,6 +528,8 @@ export default class Client extends EventEmitter {
       if (err) { debug(`id: ${this.id} acknowledgeGroupMessage: groupId: ${msg.toId}` +
                        ` id: ${msg.fromId} err: ${err}`); }
       if (!acknowledged) { return; }
+
+      States.addUserToActiveCallGroup(msg.fromId, msg.toId);
 
       Recorder.start(msg);
 
@@ -445,42 +556,21 @@ export default class Client extends EventEmitter {
       if (callback) { return callback(null, true); }
     }
 
-    debug(`id ${this.id} Starting to check busy status`);
+    debug(`id ${this.id} Starting to acquire floor`);
     Q.Promise((resolve, reject) => {
-      States.getBusyStateOfGroup(msg.toId, (err, busyWithUserId) => {
+      States.acquireFloorOfGroup(msg.toId, msg.fromId, (err, acquired, floorOwner) => {
         if (err) { return reject(err); }
-        if (!busyWithUserId) {
-          debug(`id ${this.id} States.getBusyStateOfGroup ${msg.toId} is not busy`);
-        } else if (busyWithUserId === msg.fromId) {
-          debug(`id ${this.id} States.getBusyStateOfGroup ${msg.toId} is busy with same id ${msg.fromId}`);
-        } else {
-          debug(`id ${this.id} States.getBusyStateOfGroup ${msg.toId} is busyWithUserId ${busyWithUserId}`);
-        }
-        return resolve(busyWithUserId);
-      });
-    }).then((busyWithUserId: numberOrString) => {
-      return Q.Promise((resolve, reject) => {
-        if (!busyWithUserId || busyWithUserId === msg.fromId) {
-          return resolve(false);
-        } else {
-          States.getAudioTimeOfGroup(msg.toId, (err, audioTime) => {
-            if (!audioTime) {
-              debug(`id ${this.id} States.getAudioTimeOfGroup ${msg.toId} audioTime ${audioTime}`);
-              return resolve(false);
-            }
-            const idleDuration = Date.now() - audioTime;
-            if (idleDuration < MAXIMUM_IDLE_DURATION) {
-              return resolve(true);
-            } else {
-              debug(`id ${this.id} States.getBusyStateOfGroup ${msg.toId} is busyWithUserId ${busyWithUserId}` +
-                          ` with MAXIMUM_IDLE_DURATION ${idleDuration}`);
-              return resolve(false);
-            }
+        if (acquired) {
+          States.setCurrentMessageOfGroup(msg.toId, msg, function(setErr) {
+            if (setErr) { return reject(setErr); }
+            return resolve(false);
           });
+        } else {
+          debug(`id ${this.id} floor busy for group ${msg.toId} owner ${floorOwner}`);
+          return resolve(true);
         }
       });
     }).then((busy: boolean) => {
-      if (!busy) { States.setCurrentMessageOfGroup(msg.toId, msg); }
 
       let payload: string;
       let messageType: number;
@@ -524,7 +614,15 @@ export default class Client extends EventEmitter {
 
   private handleConnectionClose = (connection: Connection) => {
     delete this.connections[connection.key];
-    this.emit("unregister", this);
+    if (Object.keys(this.connections).length <= 0) {
+      clearInterval(this.pingInterval);
+      this.pingInterval = null;
+      States.getGroupsWithActiveParticipant(this.id, (err, activeGroups) => {
+        States.removeActiveParticipantFromAllGroups(this.id);
+        States.releaseFloorOwnershipForUser(this.id);
+        this.emit("unregister", this, activeGroups || []);
+      });
+    }
   }
 
   private handleConnectionMessage = (msg: IMessage) => {
