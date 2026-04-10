@@ -21,6 +21,9 @@ const MESSAGE_KEY_FORMAT = "m.%s";
 // SETS
 const USER_GROUPS_KEY_FORMAT = "u.%s.g";
 const GROUP_USERS_KEY_FORMAT = "g.%s.u";
+// SETS - active call state (with TTL, so stale data auto-expires)
+const ACTIVE_GROUP_PARTICIPANTS_KEY_FORMAT = "g.%s.ap";
+const ACTIVE_USER_GROUPS_KEY_FORMAT = "u.%s.ag";
 
 const UUIDS_KEY = util.format(UUIDS_KEY_FORMAT, NETWORK);
 
@@ -80,6 +83,14 @@ export class Keys {
 
   public static forMessageWithId(messageId: string): string {
     return util.format(MESSAGE_KEY_FORMAT, messageId);
+  }
+
+  public static forActiveParticipantsOfGroup(groupId: numberOrString): string {
+    return util.format(ACTIVE_GROUP_PARTICIPANTS_KEY_FORMAT, groupId);
+  }
+
+  public static forActiveGroupsOfUser(userId: numberOrString): string {
+    return util.format(ACTIVE_USER_GROUPS_KEY_FORMAT, userId);
   }
 
   // HASHES

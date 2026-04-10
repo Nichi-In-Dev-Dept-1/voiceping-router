@@ -4,6 +4,7 @@ import * as EventEmitter from "events";
 import * as dbug from "debug";
 import * as WebSocket from "ws";
 
+import config = require("./config");
 import logger = require("./logger");
 import MessageType = require("./messagetype");
 import { packer } from "./packer";
@@ -19,6 +20,7 @@ export default class Connection extends EventEmitter {
   public key: string;
 
   private clientId: numberOrString;
+  private heartbeatCloseTimer: NodeJS.Timer;
   private socket: WebSocket;
   private timestamp: number;
 
@@ -41,13 +43,55 @@ export default class Connection extends EventEmitter {
   public ping(this: Connection) {
     if (this.socket.readyState === WebSocket.OPEN) {
       try {
-        this.socket.ping("voiceping:" + this.clientId, false, true);
+        this.socket.ping("voiceping:" + this.clientId, false);
       } catch (exception) {
         debug(`id ${this.clientId} key ${this.key}` +
               ` PING ERR ${JSON.stringify(exception)}` +
               ` device ${this.deviceId}`);
       }
     }
+  }
+
+  public getLastSeenAt(this: Connection) {
+    return this.timestamp;
+  }
+
+  public terminate(this: Connection) {
+    logger.info(`id: ${this.clientId} key: ${this.key} TERMINATE readyState: ${this.socket.readyState}`);
+    try {
+      this.socket.terminate();
+    } catch (exception) {
+      debug(`id ${this.clientId} key ${this.key} TERMINATE ERR ${JSON.stringify(exception)} device ${this.deviceId}`);
+    }
+  }
+
+  public closeDueToHeartbeatTimeout(this: Connection, idleTime: number) {
+    logger.info(
+      `id: ${this.clientId} key: ${this.key} HEARTBEAT_TIMEOUT idleTime: ${idleTime}` +
+      ` readyState: ${this.socket.readyState}`
+    );
+
+    if (this.socket.readyState !== WebSocket.OPEN) {
+      this.terminate();
+      return;
+    }
+
+    try {
+      this.socket.close(1001, "heartbeat timeout");
+    } catch (exception) {
+      debug(`id ${this.clientId} key ${this.key}` +
+            ` HEARTBEAT CLOSE ERR ${JSON.stringify(exception)}` +
+            ` device ${this.deviceId}`);
+      this.terminate();
+      return;
+    }
+
+    this.clearHeartbeatCloseTimer();
+    this.heartbeatCloseTimer = setTimeout(() => {
+      if (this.socket.readyState !== WebSocket.CLOSED) {
+        this.terminate();
+      }
+    }, config.heartbeatCloseGracePeriod);
   }
 
   public send(this: Connection, data: Buffer, msg?: IMessage) {
@@ -90,6 +134,8 @@ export default class Connection extends EventEmitter {
           ` handleSocketClose code ${code} reason ${reason}` +
           ` device ${this.deviceId}`);
 
+    this.clearHeartbeatCloseTimer();
+
     this.socket.removeListener("close", this.handleSocketClose);
     this.socket.removeListener("error", this.handleSocketError);
     this.socket.removeListener("message", this.handleSocketMessage);
@@ -106,6 +152,7 @@ export default class Connection extends EventEmitter {
   }
 
   private handleSocketMessage = (data: Buffer) => {
+    this.timestamp = Date.now();
     debug(`*************************************`);
     debug(`id ${this.clientId} key ${this.key}` +
               ` handleSocketMessage RAW data: ${data.toString()}` +
@@ -144,5 +191,11 @@ export default class Connection extends EventEmitter {
           ` handleSocketPong ${payload}` +
           ` device ${this.deviceId}`);
     this.emit("pong", payload);
+  }
+
+  private clearHeartbeatCloseTimer(this: Connection) {
+    if (!this.heartbeatCloseTimer) { return; }
+    clearTimeout(this.heartbeatCloseTimer);
+    this.heartbeatCloseTimer = null;
   }
 }

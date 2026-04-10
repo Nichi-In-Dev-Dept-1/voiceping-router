@@ -4,6 +4,7 @@ import * as jwt from "jwt-simple";
 
 import config = require("./config");
 import { Keys } from "./keys";
+import Redis = require("./redis");
 import { IMessage, numberOrString } from "./types";
 
 const dbug1 = dbug("vp:states");
@@ -22,6 +23,9 @@ const usersInsideGroupsSet = {};
 const usersCurrentMessagesSet = {};
 const groupsOfUsersSet = {};
 const groupsCurrentMessagesSet = {};
+const groupsActiveParticipantsSet = {};
+const activeCallGroupsOfUsersSet = {};
+const groupsDroppedParticipantsSet = {};
 
 interface IMessage2 {
   audioTime?: number;
@@ -114,6 +118,223 @@ export default class States {
         return callback(null, userIds);
       });
     }
+  }
+
+  public static getActiveParticipantsOfGroup(
+    groupId: numberOrString,
+    callback: (err: Error, userIds: Array<number|string>) => void
+  ) {
+    groupId = groupId + "";
+    const inMemory = (groupsActiveParticipantsSet[groupId] || []);
+    if (inMemory.length > 0) {
+      return callback(null, inMemory.slice());
+    }
+    // Fallback to Redis (e.g. after a server restart)
+    Redis.getActiveParticipantsOfGroup(groupId, (err, userIds) => {
+      if (!err && userIds && userIds.length > 0) {
+        groupsActiveParticipantsSet[groupId] = userIds;
+      }
+      return callback(err, userIds || []);
+    });
+  }
+
+  public static addActiveParticipantToGroup(
+    groupId: numberOrString,
+    userId: numberOrString,
+    callback?: (err: Error, count: number) => void
+  ) {
+    groupId = groupId + "";
+    userId = userId + "";
+    const current = (groupsActiveParticipantsSet[groupId] || []).map((id) => id + "");
+    if (!current.includes(userId)) {
+      current.push(userId);
+    }
+    groupsActiveParticipantsSet[groupId] = current;
+    debug(
+      `ACTIVE_PARTICIPANTS add groupId:${groupId} userId:${userId}` +
+      ` count:${current.length} users:${JSON.stringify(current)}`
+    );
+    Redis.addActiveParticipantToGroup(groupId, userId); // persist with TTL for restart recovery
+    if (callback) { return callback(null, current.length); }
+    return;
+  }
+
+  public static addUserToActiveCallGroup(
+    userId: numberOrString,
+    groupId: numberOrString,
+    callback?: (err: Error, count: number) => void
+  ) {
+    userId = userId + "";
+    groupId = groupId + "";
+    const droppedUsers = (groupsDroppedParticipantsSet[groupId] || []).map((id) => id + "");
+    if (droppedUsers.includes(userId)) {
+      groupsDroppedParticipantsSet[groupId] = droppedUsers.filter((id) => id !== userId);
+    }
+    const currentGroups = (activeCallGroupsOfUsersSet[userId] || []).map((id) => id + "");
+    if (!currentGroups.includes(groupId)) {
+      currentGroups.push(groupId);
+    }
+    activeCallGroupsOfUsersSet[userId] = currentGroups;
+    Redis.addActiveGroupForUser(userId, groupId); // persist for restart recovery
+    return States.addActiveParticipantToGroup(groupId, userId, callback);
+  }
+
+  public static removeUserFromActiveCallGroup(
+    userId: numberOrString,
+    groupId: numberOrString,
+    callback?: (err: Error, count: number) => void
+  ) {
+    userId = userId + "";
+    groupId = groupId + "";
+    const droppedUsers = (groupsDroppedParticipantsSet[groupId] || []).map((id) => id + "");
+    if (!droppedUsers.includes(userId)) {
+      droppedUsers.push(userId);
+    }
+    groupsDroppedParticipantsSet[groupId] = droppedUsers;
+    const currentGroups = (activeCallGroupsOfUsersSet[userId] || [])
+      .map((id) => id + "")
+      .filter((id) => id !== groupId);
+    activeCallGroupsOfUsersSet[userId] = currentGroups;
+    Redis.removeActiveGroupForUser(userId, groupId);
+    return States.removeActiveParticipantFromGroup(groupId, userId, callback);
+  }
+
+  public static getActiveCallGroupsOfUser(
+    userId: numberOrString,
+    callback: (err: Error, groupIds: Array<number|string>) => void
+  ) {
+    userId = userId + "";
+    return callback(null, (activeCallGroupsOfUsersSet[userId] || []).slice());
+  }
+
+  public static clearActiveCallGroup(
+    groupId: numberOrString,
+    callback?: (err: Error, count: number) => void
+  ) {
+    groupId = groupId + "";
+    delete groupsDroppedParticipantsSet[groupId];
+    Object.keys(activeCallGroupsOfUsersSet).forEach((userId) => {
+      activeCallGroupsOfUsersSet[userId] = (activeCallGroupsOfUsersSet[userId] || [])
+        .map((id) => id + "")
+        .filter((id) => id !== groupId);
+      Redis.removeActiveGroupForUser(userId, groupId);
+    });
+    return States.clearActiveParticipantsOfGroup(groupId, callback);
+  }
+
+  public static removeActiveParticipantFromGroup(
+    groupId: numberOrString,
+    userId: numberOrString,
+    callback?: (err: Error, count: number) => void
+  ) {
+    groupId = groupId + "";
+    userId = userId + "";
+    const current = (groupsActiveParticipantsSet[groupId] || [])
+      .map((id) => id + "")
+      .filter((id) => id !== userId);
+    groupsActiveParticipantsSet[groupId] = current;
+    debug(
+      `ACTIVE_PARTICIPANTS remove groupId:${groupId} userId:${userId}` +
+      ` count:${current.length} users:${JSON.stringify(current)}`
+    );
+    Redis.removeActiveParticipantFromGroup(groupId, userId);
+    if (callback) { return callback(null, current.length); }
+    return;
+  }
+
+  public static clearActiveParticipantsOfGroup(
+    groupId: numberOrString,
+    callback?: (err: Error, count: number) => void
+  ) {
+    groupId = groupId + "";
+    groupsActiveParticipantsSet[groupId] = [];
+    delete groupsDroppedParticipantsSet[groupId];
+    debug(`ACTIVE_PARTICIPANTS clear groupId:${groupId} count:0 users:[]`);
+    Redis.clearActiveParticipantsOfGroup(groupId);
+    if (callback) { return callback(null, 0); }
+    return;
+  }
+
+  public static getActiveParticipantCountOfGroup(
+    groupId: numberOrString,
+    callback: (err: Error, count: number) => void
+  ) {
+    groupId = groupId + "";
+    return callback(null, (groupsActiveParticipantsSet[groupId] || []).length);
+  }
+
+  public static removeActiveParticipantFromAllGroups(
+    userId: numberOrString,
+    callback?: (err: Error, removedGroups: Array<number|string>) => void
+  ) {
+    userId = userId + "";
+    const inMemoryGroups: Array<number|string> =
+      (activeCallGroupsOfUsersSet[userId] || []).map((id) => id + "");
+
+    const doRemove = (groupIds: Array<number|string>) => {
+      delete activeCallGroupsOfUsersSet[userId];
+      Redis.clearActiveGroupsOfUser(userId);
+      groupIds.forEach((groupId) => {
+        const current = (groupsActiveParticipantsSet[groupId] || []).map((id) => id + "");
+        groupsActiveParticipantsSet[groupId] = current.filter((id) => id !== userId + "");
+        debug(
+          `ACTIVE_PARTICIPANTS disconnect-remove groupId:${groupId} userId:${userId}` +
+          ` count:${groupsActiveParticipantsSet[groupId].length}` +
+          ` users:${JSON.stringify(groupsActiveParticipantsSet[groupId])}`
+        );
+        Redis.removeActiveParticipantFromGroup(groupId, userId);
+      });
+      if (callback) { return callback(null, groupIds); }
+    };
+
+    if (inMemoryGroups.length > 0) {
+      return doRemove(inMemoryGroups);
+    }
+
+    // Fallback to Redis when in-memory is empty (e.g. after a server restart)
+    Redis.getActiveGroupsOfUser(userId, (err, redisGroups) => {
+      doRemove(redisGroups || []);
+    });
+  }
+
+  public static getGroupsWithActiveParticipant(
+    userId: numberOrString,
+    callback: (err: Error, groupIds: Array<number|string>) => void
+  ) {
+    userId = userId + "";
+    const inMemory = (activeCallGroupsOfUsersSet[userId] || []).map((id) => id + "");
+    if (inMemory.length > 0) {
+      return callback(null, inMemory);
+    }
+    // Fallback to Redis (e.g. after a server restart where in-memory was wiped)
+    Redis.getActiveGroupsOfUser(userId, (err, groupIds) => {
+      if (!err && groupIds && groupIds.length > 0) {
+        activeCallGroupsOfUsersSet[userId] = groupIds;
+      }
+      return callback(err, groupIds || []);
+    });
+  }
+
+  public static releaseFloorOwnershipForUser(
+    userId: numberOrString,
+    callback?: (err: Error, releasedGroups: Array<number|string>) => void
+  ) {
+    userId = userId + "";
+    const releasedGroups: Array<number|string> = [];
+    Object.keys(groupsCurrentMessagesSet).forEach((groupId) => {
+      const message = groupsCurrentMessagesSet[groupId];
+      if (message && (message.fromId + "") === userId) {
+        groupsCurrentMessagesSet[groupId] = null;
+        releasedGroups.push(groupId);
+        if (memored) {
+          memored.remove(Keys.forCurrentMessageOfGroup(groupId), function() {
+            return;
+          });
+        }
+      }
+    });
+    if (callback) { return callback(null, releasedGroups); }
+    return;
   }
 
   public static setGroupsOfUser(
@@ -272,6 +493,85 @@ export default class States {
     }
   }
 
+  public static isFloorOwnerOfGroup(
+    groupId: numberOrString,
+    userId: numberOrString,
+    callback: (err: Error, isOwner: boolean) => void
+  ) {
+    groupId = groupId + "";
+    userId = userId + "";
+    States.getBusyStateOfGroup(groupId, (err, busyWithUserId) => {
+      if (err) { return callback(err, false); }
+      return callback(null, !!busyWithUserId && busyWithUserId + "" === userId);
+    });
+  }
+
+  public static acquireFloorOfGroup(
+    groupId: numberOrString,
+    userId: numberOrString,
+    callback: (err: Error, acquired: boolean, floorOwner: numberOrString) => void
+  ) {
+    groupId = groupId + "";
+    userId = userId + "";
+    States.getCurrentMessageOfGroup(groupId, (err, message) => {
+      if (err) { return callback(err, false, 0); }
+
+      const now = Date.now();
+      const currentOwner = message && message.fromId ? message.fromId + "" : "0";
+      const audioTime = message && message.audioTime ? message.audioTime : 0;
+      const idleDuration = audioTime ? now - audioTime : Number.MAX_SAFE_INTEGER;
+      const isStale = !!currentOwner && currentOwner !== "0" && idleDuration >= config.message.maximumIdleDuration;
+
+      if (currentOwner && currentOwner !== "0" && currentOwner !== userId && !isStale) {
+        return callback(null, false, currentOwner);
+      }
+
+      States.setBusyStateOfGroup(groupId, userId, (setErr, floorOwner) => {
+        if (setErr) { return callback(setErr, false, currentOwner); }
+        return callback(null, true, floorOwner);
+      });
+    });
+  }
+
+  public static refreshFloorOfGroup(
+    groupId: numberOrString,
+    userId: numberOrString,
+    callback?: (err: Error, refreshed: boolean) => void
+  ) {
+    groupId = groupId + "";
+    userId = userId + "";
+    States.isFloorOwnerOfGroup(groupId, userId, (err, isOwner) => {
+      if (err || !isOwner) {
+        if (callback) { return callback(err, false); }
+        return;
+      }
+      States.updateAudioTimeOfGroup(groupId, callback);
+    });
+  }
+
+  public static releaseFloorOfGroup(
+    groupId: numberOrString,
+    userId: numberOrString,
+    callback?: (err: Error, released: boolean) => void
+  ) {
+    groupId = groupId + "";
+    userId = userId + "";
+    States.isFloorOwnerOfGroup(groupId, userId, (err, isOwner) => {
+      if (err || !isOwner) {
+        if (callback) { return callback(err, false); }
+        return;
+      }
+      States.removeBusyStateOfGroup(groupId, function(removeErr) {
+        if (removeErr) {
+          if (callback) { return callback(removeErr, false); }
+          return;
+        }
+        if (callback) { return callback(null, true); }
+        return;
+      });
+    });
+  }
+
   public static setBusyStateOfGroup(
     groupId: numberOrString, busyWithUserId: numberOrString,
     callback?: (err: Error, busyWithUserId: numberOrString) => void) {
@@ -380,9 +680,15 @@ export default class States {
     if (inspectInterval) { return; }
 
     inspectInterval = setInterval(function() {
-      debug(`inspectInterval: ${Object.keys(groupsCurrentMessagesSet).length}:` +
-                  ` ${JSON.stringify(groupsCurrentMessagesSet)}`);
-      Object.keys(groupsCurrentMessagesSet).forEach(function(groupId) {
+      const groupIds = Object.keys(groupsCurrentMessagesSet);
+      debug(`inspectInterval: ${groupIds.length}: ${JSON.stringify(groupsCurrentMessagesSet)}`);
+
+      // Process groups one-at-a-time via setImmediate to avoid blocking the event loop
+      // when there are many active groups (prevents ping/pong and message handling delays).
+      let index = 0;
+      function processNext() {
+        if (index >= groupIds.length) { return; }
+        const groupId = groupIds[index++];
         const message: IMessage2 = groupsCurrentMessagesSet[groupId];
         if (!!message) {
           const userId = message.fromId;
@@ -391,14 +697,15 @@ export default class States {
             const duration = Date.now() - startTime;
             if (duration > GROUPS_BUSY_TIMEOUT) {
               States.removeBusyStateOfGroup(groupId);
-
               debug(`GROUPS_BUSY_TIMEOUT userId: ${userId} takes ${duration}` +
-                          ` more than ${GROUPS_BUSY_TIMEOUT} talking,` +
-                          ` channel is no longer busy`);
+                    ` more than ${GROUPS_BUSY_TIMEOUT} talking,` +
+                    ` channel is no longer busy`);
             }
           }
         }
-      });
+        setImmediate(processNext);
+      }
+      processNext();
     }, GROUPS_INSPECT_INTERVAL);
   }
 }

@@ -211,7 +211,7 @@ class Recorder {
 
     const now = Date.now();
     const startTime = this.recordStartTimesSet[currentFileName];
-    const duration = now - startTime;
+    const duration = startTime ? (now - startTime) : 0;
     delete this.recordStartTimesSet[currentFileName];
 
     let uploadFileName: string;

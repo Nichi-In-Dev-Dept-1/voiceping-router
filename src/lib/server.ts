@@ -88,15 +88,107 @@ class Server implements IServer {
   }
 
   public sendMessageToGroup(this: Server, msg: IMessage) {
-    logger.info(`sendMessageToGroup from: ${msg.fromId} to: ${msg.toId} messageType: ${msg.messageType}`);
-    packer.pack(msg, (err, packed) => {
-      this.sendDataFromUserToGroup(packed, msg.fromId, msg.toId);
+    this.applyAuthoritativeGroupMeta(msg, () => {
+      const messageIdForLog = msg.messageType === MessageType.TEXT ||
+        msg.messageType === MessageType.INTERACTIVE ||
+        msg.messageType === MessageType.START ||
+        msg.messageType === MessageType.STOP
+        ? msg.messageId
+        : "[omitted]";
+      logger.info(
+        `sendMessageToGroup from: ${msg.fromId} to: ${msg.toId}` +
+        ` messageType: ${msg.messageType} messageId: ${messageIdForLog}`
+      );
+      packer.pack(msg, (err, packed) => {
+        // Echo JoinAcknowledgement back to the sender so they receive the
+        // router-authoritative count (sendDataFromUserToGroup skips the sender by default).
+        let echoToSender = false;
+        try {
+          const meta = JSON.parse(msg.messageId as string);
+          echoToSender = !!(meta && meta.textMessageType === "JoinAcknowledgement");
+        } catch (e) { /* non-JSON messageId — no echo */ }
+        this.sendDataFromUserToGroup(packed, msg.fromId, msg.toId, echoToSender);
+      });
     });
   }
 
-  private handleClientUnregister = (client: Client) => {
+  private applyAuthoritativeGroupMeta(this: Server, msg: IMessage, callback: () => void) {
+    if (
+      msg.channelType !== ChannelType.GROUP ||
+      (msg.messageType !== MessageType.TEXT && msg.messageType !== MessageType.INTERACTIVE) ||
+      !msg.messageId ||
+      typeof msg.messageId !== "string"
+    ) {
+      callback();
+      return;
+    }
+
+    let meta;
+    try {
+      meta = JSON.parse(msg.messageId);
+    } catch (error) {
+      callback();
+      return;
+    }
+
+    if (!meta || !meta.textMessageType) {
+      callback();
+      return;
+    }
+
+    if (meta.textMessageType === "CallEndedForAll") {
+      meta.membersInCall = 0;
+      msg.messageId = JSON.stringify(meta);
+      callback();
+      return;
+    }
+
+    if (meta.textMessageType !== "JoinAcknowledgement" && meta.textMessageType !== "DropCall") {
+      callback();
+      return;
+    }
+
+    States.getActiveParticipantCountOfGroup(msg.toId, (err, count) => {
+      meta.membersInCall = count;
+      msg.messageId = JSON.stringify(meta);
+      callback();
+    });
+  }
+
+  private handleClientUnregister = (client: Client, activeGroups?: Array<number|string>) => {
     const clientId = client.id;
     if (!this.clients[clientId]) { return; }
+
+    (activeGroups || []).forEach((groupId) => {
+      States.getActiveParticipantCountOfGroup(groupId, (err, count) => {
+        logger.info(`PARTICIPANT_COUNT disconnect groupId ${groupId} user ${clientId} count ${count}`);
+
+        let safeCallId = groupId + "";
+        if (safeCallId.startsWith("TELENET_")) {
+          safeCallId = safeCallId.substring("TELENET_".length);
+        }
+
+        const message = {
+          channelType: ChannelType.GROUP,
+          fromId: clientId,
+          messageId: JSON.stringify({
+            callId: safeCallId,
+            errorType: "",
+            lang: "ja-JP",
+            membersInCall: count,
+            textMessageType: "DropCall",
+            translate: false
+          }),
+          messageType: MessageType.TEXT,
+          payload: JSON.stringify({
+            message_id: Date.now().toString(),
+            text: ""
+          }),
+          toId: groupId
+        };
+        this.sendMessageToGroup(message);
+      });
+    });
 
     client.removeListener("message", this.handleClientMessage);
     client.removeListener("unregister", this.handleClientUnregister);
@@ -132,6 +224,24 @@ class Server implements IServer {
     client.registerSocket(socket, key, deviceId);
     this.sockets[id] = socket;
 
+    if (user && user.channelIds instanceof Array) {
+      user.channelIds.forEach((groupId) => {
+        Redis.addUserToGroup(id, groupId, (err) => {
+          if (err) {
+            logger.error(`registerClient addUserToGroup id ${id} groupId ${groupId} ERR ${err}`);
+            return;
+          }
+          Redis.getUsersInsideGroup(groupId, (groupErr, userIds) => {
+            if (groupErr) {
+              logger.error(`registerClient getUsersInsideGroup groupId ${groupId} ERR ${groupErr}`);
+              return;
+            }
+            States.setUsersInsideGroup(groupId, userIds);
+          });
+        });
+      });
+    }
+
     // tslint:disable-next-line:max-line-length
     logger.info(`REGISTERED id ${client.id} clients ${Object.keys(this.clients).length} readyState ${socket.readyState} ` +
                 ` sockets ${Object.keys(this.sockets).length} wss ${this.wss.clients.size}`);
@@ -150,7 +260,13 @@ class Server implements IServer {
 
   private getUserFromToken(token) {
     const deferred = Q.defer();
-    deferred.resolve({ uid: token });
+    States.getUserFromToken(token, (err, user) => {
+      if (err) {
+        deferred.resolve({ uid: token });
+        return;
+      }
+      deferred.resolve(user);
+    });
     return deferred.promise;
   }
 
