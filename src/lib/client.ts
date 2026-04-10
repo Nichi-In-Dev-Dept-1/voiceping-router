@@ -21,7 +21,6 @@ function debug(msg: string) {
   dbug1((cluster.worker ? `worker ${cluster.worker.id} ` : "") + msg);
 }
 
-const MAXIMUM_IDLE_DURATION: number = config.message.maximumIdleDuration;
 const PING_INTERVAL: number = config.pingInterval;
 const PING_TIMEOUT: number = config.pingTimeout;
 
@@ -61,6 +60,15 @@ export default class Client extends EventEmitter {
     this.connections[key] = connection;
 
     this.isLoginDuplicated(deviceId, key, (err, data) => {
+      // Guard against race condition: if two sockets connect simultaneously, the first
+      // callback to complete will close the other via closeConnectionsExceptKey. When
+      // the second callback fires, its connection is already gone — bail out to avoid
+      // closing the now-active connection and triggering an unwanted unregister.
+      if (!this.connections[key]) {
+        logger.info(`id ${this.id} key ${key} connection replaced before duplicate check completed, skipping`);
+        return;
+      }
+
       const { duplicated, oldDeviceId, newDeviceId } = data;
 
       logger.info(`id ${this.id} key ${key} isLoginDuplicated duplicate: ${duplicated}, ` +
@@ -152,8 +160,8 @@ export default class Client extends EventEmitter {
       if (!connection) { return; }
       const idleTime = Date.now() - connection.getLastSeenAt();
       if (idleTime > PING_TIMEOUT) {
-        logger.info(`id ${this.id} key ${key} ping timeout after ${idleTime}ms, terminating socket`);
-        connection.terminate();
+        logger.info(`id ${this.id} key ${key} ping timeout after ${idleTime}ms, closing socket`);
+        connection.closeDueToHeartbeatTimeout(idleTime);
         return;
       }
       connection.ping();

@@ -367,6 +367,102 @@ class Redis {
     });
   }
 
+  // Active call state — persisted with TTL so stale entries auto-expire after busyTimeout.
+  // These mirror the in-memory groupsActiveParticipantsSet / activeCallGroupsOfUsersSet
+  // in states.ts, surviving server restarts so participant counts and DropCall signals
+  // remain correct across deploys/crashes.
+
+  private static readonly ACTIVE_STATE_TTL = Math.ceil(config.group.busyTimeout / 1000);
+
+  public static addActiveParticipantToGroup(
+    groupId: numberOrString, userId: numberOrString,
+    callback?: (err: Error, count: number) => void
+  ) {
+    const key = Keys.forActiveParticipantsOfGroup(groupId);
+    const multi = client.multi();
+    multi.sadd(key, userId + "");
+    multi.expire(key, Redis.ACTIVE_STATE_TTL);
+    multi.exec(function(err) {
+      if (err) { if (callback) { return callback(err, 0); } return; }
+      client.scard(key, function(err2, count) {
+        if (callback) { return callback(err2, count || 0); }
+      });
+    });
+  }
+
+  public static removeActiveParticipantFromGroup(
+    groupId: numberOrString, userId: numberOrString,
+    callback?: (err: Error, count: number) => void
+  ) {
+    const key = Keys.forActiveParticipantsOfGroup(groupId);
+    client.srem(key, userId + "", function(err) {
+      if (err) { if (callback) { return callback(err, 0); } return; }
+      client.scard(key, function(err2, count) {
+        if (callback) { return callback(err2, count || 0); }
+      });
+    });
+  }
+
+  public static getActiveParticipantsOfGroup(
+    groupId: numberOrString,
+    callback: (err: Error, userIds: string[]) => void
+  ) {
+    client.smembers(Keys.forActiveParticipantsOfGroup(groupId), function(err, userIds) {
+      if (err) { return callback(err, []); }
+      return callback(null, userIds || []);
+    });
+  }
+
+  public static clearActiveParticipantsOfGroup(
+    groupId: numberOrString,
+    callback?: (err: Error) => void
+  ) {
+    client.del(Keys.forActiveParticipantsOfGroup(groupId), function(err) {
+      if (callback) { return callback(err); }
+    });
+  }
+
+  public static addActiveGroupForUser(
+    userId: numberOrString, groupId: numberOrString,
+    callback?: (err: Error) => void
+  ) {
+    const key = Keys.forActiveGroupsOfUser(userId);
+    const multi = client.multi();
+    multi.sadd(key, groupId + "");
+    multi.expire(key, Redis.ACTIVE_STATE_TTL);
+    multi.exec(function(err) {
+      if (callback) { return callback(err); }
+    });
+  }
+
+  public static removeActiveGroupForUser(
+    userId: numberOrString, groupId: numberOrString,
+    callback?: (err: Error) => void
+  ) {
+    client.srem(Keys.forActiveGroupsOfUser(userId), groupId + "", function(err) {
+      if (callback) { return callback(err); }
+    });
+  }
+
+  public static getActiveGroupsOfUser(
+    userId: numberOrString,
+    callback: (err: Error, groupIds: string[]) => void
+  ) {
+    client.smembers(Keys.forActiveGroupsOfUser(userId), function(err, groupIds) {
+      if (err) { return callback(err, []); }
+      return callback(null, groupIds || []);
+    });
+  }
+
+  public static clearActiveGroupsOfUser(
+    userId: numberOrString,
+    callback?: (err: Error) => void
+  ) {
+    client.del(Keys.forActiveGroupsOfUser(userId), function(err) {
+      if (callback) { return callback(err); }
+    });
+  }
+
   public static periodicClean() {
     if (cleanInterval) { return; }
     cleanInterval = setInterval(function() {
