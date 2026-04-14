@@ -463,6 +463,139 @@ class Redis {
     });
   }
 
+  // ---------------------------------------------------------------------------
+  // Atomic floor-lock methods (cluster-safe via Redis SET NX EX + Lua script)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Try to acquire the private-channel floor for a one-to-one call.
+   * Uses SET NX EX so only ONE worker across the entire cluster can win.
+   * @param sortedPairKey  Already-sorted "userA|userB" string (from privateFloorKey()).
+   * @param userId         The requesting user.
+   * @param ttlSeconds     Auto-expire the lock after this many seconds (crash safety).
+   * @param callback       acquired=true  → caller owns the floor.
+   *                       acquired=false → currentOwner holds it.
+   */
+  public static acquirePrivateFloor(
+    sortedPairKey: string,
+    userId: string,
+    ttlSeconds: number,
+    callback: (err: Error, acquired: boolean, currentOwner: string) => void
+  ): void {
+    const key = Keys.forPrivateFloor(sortedPairKey);
+    // SET key userId NX EX ttl  → "OK" on success, null if key already exists
+    (client as any).set(key, userId, "NX", "EX", ttlSeconds, function(err: Error, reply: string) {
+      if (err) { return callback(err, false, null); }
+      if (reply === "OK") {
+        // We won the race
+        return callback(null, true, userId);
+      }
+      // Someone else holds it — find out who
+      client.get(key, function(err2: Error, currentOwner: string) {
+        if (err2) { return callback(err2, false, null); }
+        return callback(null, false, currentOwner || "");
+      });
+    });
+  }
+
+  /**
+   * Release the private-channel floor.  Only the owner can release it.
+   * Uses a Lua script so GET + DEL execute atomically on the Redis server —
+   * a different worker cannot sneak in between the check and the delete.
+   */
+  public static releasePrivateFloor(
+    sortedPairKey: string,
+    userId: string,
+    callback?: (err: Error, released: boolean) => void
+  ): void {
+    const key = Keys.forPrivateFloor(sortedPairKey);
+    const lua = `
+      if redis.call("GET", KEYS[1]) == ARGV[1] then
+        return redis.call("DEL", KEYS[1])
+      else
+        return 0
+      end
+    `;
+    (client as any).eval(lua, 1, key, userId, function(err: Error, result: number) {
+      if (err) { if (callback) { return callback(err, false); } return; }
+      if (callback) { return callback(null, result === 1); }
+    });
+  }
+
+  /**
+   * Try to acquire the group floor atomically across all cluster workers.
+   * @param groupId     The group whose floor is being contested.
+   * @param userId      The requesting user.
+   * @param ttlSeconds  Auto-expire TTL (crash safety).
+   * @param callback    acquired=true → caller owns the floor.
+   */
+  public static acquireGroupFloor(
+    groupId: numberOrString,
+    userId: string,
+    ttlSeconds: number,
+    callback: (err: Error, acquired: boolean, currentOwner: string) => void
+  ): void {
+    const key = Keys.forGroupFloor(groupId);
+    (client as any).set(key, userId, "NX", "EX", ttlSeconds, function(err: Error, reply: string) {
+      if (err) { return callback(err, false, null); }
+      if (reply === "OK") {
+        return callback(null, true, userId);
+      }
+      client.get(key, function(err2: Error, currentOwner: string) {
+        if (err2) { return callback(err2, false, null); }
+        return callback(null, false, currentOwner || "");
+      });
+    });
+  }
+
+  /**
+   * Release the group floor — owner-only, atomic Lua script.
+   */
+  public static releaseGroupFloor(
+    groupId: numberOrString,
+    userId: string,
+    callback?: (err: Error, released: boolean) => void
+  ): void {
+    const key = Keys.forGroupFloor(groupId);
+    const lua = `
+      if redis.call("GET", KEYS[1]) == ARGV[1] then
+        return redis.call("DEL", KEYS[1])
+      else
+        return 0
+      end
+    `;
+    (client as any).eval(lua, 1, key, userId, function(err: Error, result: number) {
+      if (err) { if (callback) { return callback(err, false); } return; }
+      if (callback) { return callback(null, result === 1); }
+    });
+  }
+
+  /**
+   * Refresh the TTL on an already-held group floor (called on each audio chunk).
+   * No-op when the key doesn't exist (floor was released).
+   */
+  public static refreshGroupFloor(
+    groupId: numberOrString,
+    userId: string,
+    ttlSeconds: number,
+    callback?: (err: Error) => void
+  ): void {
+    const key = Keys.forGroupFloor(groupId);
+    // Only extend TTL when we're still the owner
+    const lua = `
+      if redis.call("GET", KEYS[1]) == ARGV[1] then
+        return redis.call("EXPIRE", KEYS[1], ARGV[2])
+      else
+        return 0
+      end
+    `;
+    (client as any).eval(lua, 1, key, userId, ttlSeconds + "", function(err: Error) {
+      if (callback) { return callback(err); }
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+
   public static periodicClean() {
     if (cleanInterval) { return; }
     cleanInterval = setInterval(function() {

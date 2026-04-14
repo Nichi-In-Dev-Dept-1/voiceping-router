@@ -24,6 +24,9 @@ const GROUP_USERS_KEY_FORMAT = "g.%s.u";
 // SETS - active call state (with TTL, so stale data auto-expires)
 const ACTIVE_GROUP_PARTICIPANTS_KEY_FORMAT = "g.%s.ap";
 const ACTIVE_USER_GROUPS_KEY_FORMAT = "u.%s.ag";
+// STRINGS - atomic floor locks (SET NX EX)
+const PRIVATE_FLOOR_KEY_FORMAT = "pf.%s";
+const GROUP_FLOOR_KEY_FORMAT = "gf.%s";
 
 const UUIDS_KEY = util.format(UUIDS_KEY_FORMAT, NETWORK);
 
@@ -91,6 +94,20 @@ export class Keys {
 
   public static forActiveGroupsOfUser(userId: numberOrString): string {
     return util.format(ACTIVE_USER_GROUPS_KEY_FORMAT, userId);
+  }
+
+  /**
+   * Key for the atomic private-channel floor lock.
+   * The caller must pass the already-sorted "userId1|userId2" string
+   * (use States.privateFloorKey() to produce it).
+   */
+  public static forPrivateFloor(sortedPairKey: string): string {
+    return util.format(PRIVATE_FLOOR_KEY_FORMAT, sortedPairKey);
+  }
+
+  /** Key for the atomic group floor lock. */
+  public static forGroupFloor(groupId: numberOrString): string {
+    return util.format(GROUP_FLOOR_KEY_FORMAT, groupId);
   }
 
   // HASHES

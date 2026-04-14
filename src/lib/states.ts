@@ -27,6 +27,20 @@ const groupsActiveParticipantsSet = {};
 const activeCallGroupsOfUsersSet = {};
 const groupsDroppedParticipantsSet = {};
 
+// Local index of private-floor keys owned by each user — used ONLY for the
+// disconnect sweep.  The authoritative lock lives in Redis (SET NX EX).
+const privateFloorKeysByUser: { [userId: string]: Set<string> } = {};
+
+// Floor TTL: max call duration + a generous buffer (seconds).
+const PRIVATE_FLOOR_TTL_SEC = Math.ceil((config.group.busyTimeout / 1000) + 30);
+const GROUP_FLOOR_TTL_SEC   = Math.ceil((config.group.busyTimeout / 1000) + 30);
+
+export function privateFloorKey(userId1: numberOrString, userId2: numberOrString): string {
+  const u1 = userId1 + "";
+  const u2 = userId2 + "";
+  return u1 < u2 ? `${u1}|${u2}` : `${u2}|${u1}`;
+}
+
 interface IMessage2 {
   audioTime?: number;
   channelType?: number;
@@ -513,23 +527,23 @@ export default class States {
   ) {
     groupId = groupId + "";
     userId = userId + "";
-    States.getCurrentMessageOfGroup(groupId, (err, message) => {
+    // Use atomic Redis SET NX EX — only ONE worker across the cluster can win.
+    Redis.acquireGroupFloor(groupId, userId, GROUP_FLOOR_TTL_SEC, (err, acquired, currentOwner) => {
       if (err) { return callback(err, false, 0); }
-
-      const now = Date.now();
-      const currentOwner = message && message.fromId ? message.fromId + "" : "0";
-      const audioTime = message && message.audioTime ? message.audioTime : 0;
-      const idleDuration = audioTime ? now - audioTime : Number.MAX_SAFE_INTEGER;
-      const isStale = !!currentOwner && currentOwner !== "0" && idleDuration >= config.message.maximumIdleDuration;
-
-      if (currentOwner && currentOwner !== "0" && currentOwner !== userId && !isStale) {
-        return callback(null, false, currentOwner);
+      if (acquired) {
+        // Mirror into local message state so the rest of the code (audioTime
+        // inspection, floor-owner checks) keeps working as before.
+        States.setBusyStateOfGroup(groupId, userId, (setErr) => {
+          if (setErr) {
+            // Roll back the Redis lock so we don't leave a phantom floor.
+            Redis.releaseGroupFloor(groupId, userId);
+            return callback(setErr, false, userId);
+          }
+          return callback(null, true, userId);
+        });
+      } else {
+        return callback(null, false, currentOwner || "0");
       }
-
-      States.setBusyStateOfGroup(groupId, userId, (setErr, floorOwner) => {
-        if (setErr) { return callback(setErr, false, currentOwner); }
-        return callback(null, true, floorOwner);
-      });
     });
   }
 
@@ -556,18 +570,16 @@ export default class States {
   ) {
     groupId = groupId + "";
     userId = userId + "";
-    States.isFloorOwnerOfGroup(groupId, userId, (err, isOwner) => {
-      if (err || !isOwner) {
-        if (callback) { return callback(err, false); }
-        return;
+    // Atomically release the Redis lock (owner-only Lua script), then clear
+    // the local mirror regardless so stale in-memory state doesn't linger.
+    Redis.releaseGroupFloor(groupId, userId, (redisErr, released) => {
+      if (redisErr) {
+        debug(`releaseFloorOfGroup Redis error groupId:${groupId} userId:${userId} err:${redisErr}`);
       }
+      // Clear local mirror unconditionally — even if redis said "not owner"
+      // (e.g. TTL expired) we still want to clean up local state.
       States.removeBusyStateOfGroup(groupId, function(removeErr) {
-        if (removeErr) {
-          if (callback) { return callback(removeErr, false); }
-          return;
-        }
-        if (callback) { return callback(null, true); }
-        return;
+        if (callback) { return callback(removeErr || null, released || false); }
       });
     });
   }
@@ -675,6 +687,99 @@ export default class States {
         });
       }
   }
+
+  // ---------------------------------------------------------------------------
+  // Private-channel floor management  (cluster-safe — backed by Redis)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Atomically acquire the floor for a one-to-one private conversation.
+   * Uses Redis SET NX EX so only ONE worker in the cluster can win the race.
+   * The floor key is symmetric: acquirePrivateFloor(A,B) and acquirePrivateFloor(B,A)
+   * compete for the same Redis key, so only one side can talk at a time.
+   */
+  public static acquirePrivateFloor(
+    userId1: numberOrString,
+    userId2: numberOrString,
+    requestingUserId: numberOrString,
+    callback: (err: Error, acquired: boolean, currentOwner: numberOrString) => void
+  ): void {
+    const key = privateFloorKey(userId1, userId2);
+    const requester = requestingUserId + "";
+    Redis.acquirePrivateFloor(key, requester, PRIVATE_FLOOR_TTL_SEC, (err, acquired, currentOwner) => {
+      if (err) { return callback(err, false, 0); }
+      if (acquired) {
+        // Track locally so we can release on disconnect.
+        if (!privateFloorKeysByUser[requester]) { privateFloorKeysByUser[requester] = new Set(); }
+        privateFloorKeysByUser[requester].add(key);
+        debug(`acquirePrivateFloor key:${key} owner:${requester}`);
+      }
+      return callback(null, acquired, currentOwner || requester);
+    });
+  }
+
+  /**
+   * Release the private-channel floor.  Only the current owner can release it.
+   * Uses a Lua script (GET + DEL) so the check-and-delete is atomic in Redis.
+   */
+  public static releasePrivateFloor(
+    userId1: numberOrString,
+    userId2: numberOrString,
+    requestingUserId: numberOrString,
+    callback?: (err: Error, released: boolean) => void
+  ): void {
+    const key = privateFloorKey(userId1, userId2);
+    const requester = requestingUserId + "";
+    Redis.releasePrivateFloor(key, requester, (err, released) => {
+      if (!err && released) {
+        // Remove from local index.
+        if (privateFloorKeysByUser[requester]) { privateFloorKeysByUser[requester].delete(key); }
+        debug(`releasePrivateFloor key:${key}`);
+      }
+      if (callback) { return callback(err || null, released || false); }
+    });
+  }
+
+  /**
+   * Check whether a given user owns the private-channel floor.
+   * Reads from Redis so the answer is accurate across all cluster workers.
+   */
+  public static isPrivateFloorOwner(
+    userId1: numberOrString,
+    userId2: numberOrString,
+    userId: numberOrString,
+    callback: (err: Error, isOwner: boolean) => void
+  ): void {
+    const key = privateFloorKey(userId1, userId2);
+    const userIdStr = userId + "";
+    Redis.acquirePrivateFloor(key, userIdStr, PRIVATE_FLOOR_TTL_SEC, (err, acquired, currentOwner) => {
+      if (err) { return callback(err, false); }
+      // We only wanted to check, not grab — if we accidentally acquired, release immediately.
+      if (acquired) {
+        Redis.releasePrivateFloor(key, userIdStr);
+        return callback(null, false); // floor was free, so we're not an existing owner
+      }
+      return callback(null, currentOwner === userIdStr);
+    });
+  }
+
+  /**
+   * Release every private-channel floor slot held by the given user.
+   * Called on disconnect so a dropped connection never leaves the floor permanently locked.
+   */
+  public static releasePrivateFloorOwnershipForUser(userId: numberOrString): void {
+    const userIdStr = userId + "";
+    const keys = privateFloorKeysByUser[userIdStr];
+    if (!keys || keys.size === 0) { return; }
+    keys.forEach((key) => {
+      Redis.releasePrivateFloor(key, userIdStr, () => {
+        debug(`releasePrivateFloor on disconnect userId:${userIdStr} key:${key}`);
+      });
+    });
+    delete privateFloorKeysByUser[userIdStr];
+  }
+
+  // ---------------------------------------------------------------------------
 
   public static periodicInspect() {
     if (inspectInterval) { return; }

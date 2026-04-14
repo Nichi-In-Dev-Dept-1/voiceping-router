@@ -44,6 +44,10 @@ export default class Client extends EventEmitter {
   private pingInterval: NodeJS.Timer;
   private connections: IConnections = {};
   private server: IServer;
+  // Track in-flight START operations so a STOP that arrives before floor acquisition
+  // completes (race condition on quick tap-and-release) can be buffered and replayed.
+  private pendingGroupStart: Map<string, IMessage> = new Map();
+  private pendingGroupStop: Map<string, IMessage> = new Map();
 
   constructor(id: numberOrString, user: any, server: IServer) {
     super();
@@ -109,6 +113,7 @@ export default class Client extends EventEmitter {
     States.getGroupsWithActiveParticipant(this.id, (err, activeGroups) => {
       States.removeActiveParticipantFromAllGroups(this.id);
       States.releaseFloorOwnershipForUser(this.id);
+      States.releasePrivateFloorOwnershipForUser(this.id);
       this.emit("unregister", this, activeGroups || []);
     });
     this.closeConnections();
@@ -241,13 +246,29 @@ export default class Client extends EventEmitter {
 
   private handlePrivateStartMessage(this: Client, msg: IMessage) {
     debug(`id ${this.id} handlePrivateStartMessage ${JSON.stringify(msg)}`);
-    Recorder.start(msg);
-    this.acknowledgePrivateStartMessage(msg);
 
-    States.setCurrentMessageOfUser(msg.fromId, msg);
-
-    // this.server.sendMessageToUser(msg);
-    this.emit("message", msg, this);
+    // Acquire the private-channel floor before allowing the call to proceed.
+    // This is synchronous so it is atomic within a single server process:
+    // if both users press simultaneously, only the first START wins.
+    States.acquirePrivateFloor(msg.fromId, msg.toId, msg.fromId, (err, acquired, currentOwner) => {
+      if (!acquired) {
+        logger.info(`handlePrivateStartMessage: floor busy for ${msg.fromId}→${msg.toId},` +
+                    ` owner: ${currentOwner} — sending START_FAILED`);
+        this.message({
+          channelType: msg.channelType,
+          fromId: msg.fromId,
+          messageType: MessageType.START_FAILED,
+          payload: "Busy",
+          toId: msg.toId
+        });
+        return;
+      }
+      Recorder.start(msg);
+      this.acknowledgePrivateStartMessage(msg);
+      States.setCurrentMessageOfUser(msg.fromId, msg);
+      // this.server.sendMessageToUser(msg);
+      this.emit("message", msg, this);
+    });
   }
 
   private acknowledgePrivateStartMessage(this: Client, msg: IMessage) {
@@ -272,6 +293,17 @@ export default class Client extends EventEmitter {
           return;
         }
         if (!isOwner) {
+          // If a START for this user/group is still being processed (async floor
+          // acquisition), buffer this STOP so it gets replayed once START finishes.
+          // This handles quick tap-and-release where STOP arrives before the floor
+          // state is committed (race condition on short talk durations).
+          const startStopKey = `${msg.fromId}_${msg.toId}`;
+          if (this.pendingGroupStart.has(startStopKey)) {
+            logger.info(`handleStopMessage: buffering STOP for user ${msg.fromId}` +
+                        ` group ${msg.toId} — START still in-flight`);
+            this.pendingGroupStop.set(startStopKey, msg);
+            return;
+          }
           debug(`id ${this.id} ignoring STOP from non-owner ${msg.fromId} for group ${msg.toId}`);
           return;
         }
@@ -279,7 +311,20 @@ export default class Client extends EventEmitter {
       });
     }
 
-    return this.finishStopMessage(msg);
+    // Private: verify the sender owns the floor before processing STOP.
+    // Without this check a non-owner STOP would broadcast a spurious incomingStopTalked
+    // to the other user and corrupt their state.
+    return States.isPrivateFloorOwner(msg.fromId, msg.toId, msg.fromId, (ownerErr, isOwner) => {
+      if (ownerErr) {
+        debug(`id ${this.id} handleStopMessage private owner check err ${ownerErr}`);
+        return;
+      }
+      if (!isOwner) {
+        debug(`id ${this.id} ignoring STOP from non-owner ${msg.fromId} for private ${msg.toId}`);
+        return;
+      }
+      return this.finishStopMessage(msg);
+    });
   }
 
   private finishStopMessage(this: Client, msg: IMessage) {
@@ -306,6 +351,9 @@ export default class Client extends EventEmitter {
           States.releaseFloorOfGroup(msg.toId, msg.fromId, () => {
             States.removeCurrentMessageOfGroup(msg.toId);
           });
+        } else {
+          // Private channel: release the floor so the other user can speak next.
+          States.releasePrivateFloor(msg.fromId, msg.toId, msg.fromId);
         }
         debug(`id ${this.id} Done removing current message from states`);
         States.getBusyStateOfGroup(msg.toId, (err1, busy) => {
@@ -532,10 +580,22 @@ export default class Client extends EventEmitter {
   }
 
   private handleGroupStartMessage(this: Client, msg: IMessage) {
+    // Register the in-flight START before any async work so that a STOP arriving
+    // during floor acquisition (quick tap-and-release) can be buffered instead of
+    // silently dropped.
+    const startStopKey = `${msg.fromId}_${msg.toId}`;
+    this.pendingGroupStart.set(startStopKey, msg);
+
     this.acknowledgeGroupStartMessage(msg, (err, acknowledged) => {
+      this.pendingGroupStart.delete(startStopKey);
+
       if (err) { debug(`id: ${this.id} acknowledgeGroupMessage: groupId: ${msg.toId}` +
                        ` id: ${msg.fromId} err: ${err}`); }
-      if (!acknowledged) { return; }
+      if (!acknowledged) {
+        // Floor was busy or START failed — discard any buffered STOP.
+        this.pendingGroupStop.delete(startStopKey);
+        return;
+      }
 
       States.addUserToActiveCallGroup(msg.fromId, msg.toId);
 
@@ -553,6 +613,16 @@ export default class Client extends EventEmitter {
       });
 
       this.emit("message", msg, this);
+
+      // If STOP arrived while START was being processed (quick tap-and-release),
+      // process it now that the floor is acquired and Recorder.start() has run.
+      const bufferedStop = this.pendingGroupStop.get(startStopKey);
+      if (bufferedStop) {
+        this.pendingGroupStop.delete(startStopKey);
+        logger.info(`handleGroupStartMessage: processing buffered STOP for` +
+                    ` user ${msg.fromId} group ${msg.toId} (quick tap-and-release)`);
+        this.finishStopMessage(bufferedStop);
+      }
     });
   }
 
@@ -628,6 +698,7 @@ export default class Client extends EventEmitter {
       States.getGroupsWithActiveParticipant(this.id, (err, activeGroups) => {
         States.removeActiveParticipantFromAllGroups(this.id);
         States.releaseFloorOwnershipForUser(this.id);
+        States.releasePrivateFloorOwnershipForUser(this.id);
         this.emit("unregister", this, activeGroups || []);
       });
     }
