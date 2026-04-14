@@ -797,14 +797,13 @@ export default class States {
         const message: IMessage2 = groupsCurrentMessagesSet[groupId];
         if (!!message) {
           const userId = message.fromId;
-          const startTime = message.startTime;
-          if (!!userId && !!startTime) {
-            const duration = Date.now() - startTime;
-            if (duration > GROUPS_BUSY_TIMEOUT) {
-              States.removeBusyStateOfGroup(groupId);
-              debug(`GROUPS_BUSY_TIMEOUT userId: ${userId} takes ${duration}` +
-                    ` more than ${GROUPS_BUSY_TIMEOUT} talking,` +
-                    ` channel is no longer busy`);
+          const audioTime = message.audioTime;
+          if (!!userId && !!audioTime) {
+            const silenceDuration = Date.now() - audioTime;
+            if (silenceDuration > GROUPS_BUSY_TIMEOUT) {
+              // Properly wipe the Redis lock and local state instead of just local memory
+              States.releaseFloorOfGroup(groupId, userId);
+              debug(`GROUPS_BUSY_TIMEOUT userId: ${userId} silent for ${silenceDuration}ms (> ${GROUPS_BUSY_TIMEOUT}), channel is no longer busy`);
             }
           }
         }
