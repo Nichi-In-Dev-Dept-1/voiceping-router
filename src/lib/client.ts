@@ -376,8 +376,8 @@ export default class Client extends EventEmitter {
       States.clearUserPrivateCall(currentCall.targetId);
       States.releasePrivateFloorOwnershipForUser(userId);
       // Notify BOTH sides of the private call so their UIs reset.
-      this.sendEndCallToUser(userId, currentCall.targetId, 1);
-      this.sendEndCallToUser(currentCall.targetId, userId, 1);
+      this.sendDropCallToUser(userId, currentCall.targetId, 1, 0);
+      this.sendDropCallToUser(currentCall.targetId, userId, 1, 0);
       // IMPORTANT: must call callback() here so that Q.all(overrides) resolves
       // and proceed() forwards the SOS START to the group.  Without this the
       // SOS call is silently swallowed and the group floor leaks until TTL.
@@ -389,22 +389,11 @@ export default class Client extends EventEmitter {
       States.clearUserActiveCall(userId);
       States.removeUserFromActiveCallGroup(userId, groupId, (err, count) => {
         // 1. Notify the specific user to reset their UI
-        this.sendEndCallToUser("System", groupId, 2, userId);
+        this.sendDropCallToUser("System", groupId, 2, count, userId);
 
         // 2. Notify the rest of the group about the participant drop
-        const dropMsg = {
-          channelType: 2 as any, // Group
-          fromId: userId,
-          messageId: JSON.stringify({
-            callId: groupId.toString(),
-            membersInCall: count,
-            textMessageType: "DropCall"
-          }),
-          messageType: MessageType.TEXT,
-          payload: JSON.stringify({ text: "DropCall" }),
-          toId: groupId
-        };
-        this.server.sendMessageToGroup(dropMsg);
+        this.sendDropCallToUser(userId, groupId, 2, count);
+
         // Invoke callback only after async cleanup is done so the new SOS call
         // doesn't start connecting before this user has been fully ejected.
         callback();
@@ -412,38 +401,39 @@ export default class Client extends EventEmitter {
     }
   }
 
-  /** Sends an EndCall text message to the peer or group. */
-  private sendEndCallToUser(
+  /** Sends a DropCall text message to the peer or group. */
+  private sendDropCallToUser(
     fromId: numberOrString,
     toId: numberOrString,
     channelType: number,
+    membersInCall: number = 0,
     deliveryId?: numberOrString
   ) {
-    const endMsg = {
+    const dropMsg = {
       channelType,
       fromId,
       messageId: JSON.stringify({
         callId: toId.toString(),
         errorType: "",
         lang: "",
-        membersInCall: 0,
-        textMessageType: "EndCall",
+        membersInCall,
+        textMessageType: "DropCall",
         translate: false
       }),
       messageType: MessageType.TEXT,
       payload: JSON.stringify({
-        message_id: "EndCall",
-        text: "EndCall"
+        message_id: "DropCall",
+        text: "DropCall"
       }),
       toId
     };
     if (deliveryId) {
-      this.server.sendMessageToUser(endMsg, deliveryId);
+      this.server.sendMessageToUser(dropMsg, deliveryId);
     } else {
       if (channelType === 1) {
-        this.emit("message", endMsg, this); // Broadcast to peer via Server
+        this.emit("message", dropMsg, this); // Broadcast to peer via Server
       } else {
-        this.server.sendMessageToGroup(endMsg);
+        this.server.sendMessageToGroup(dropMsg);
       }
     }
   }
@@ -1053,7 +1043,7 @@ export default class Client extends EventEmitter {
           if (!err2 && details.inCall && details.channelType === 1) {
             // Notify the peer that this user disconnected so their UI resets and
             // they stop transmitting audio to a now-dead socket.
-            this.sendEndCallToUser(this.id, details.targetId, 1);
+            this.sendDropCallToUser(this.id, details.targetId, 1, 0);
             States.clearUserPrivateCall(details.targetId);
           }
           States.clearUserActiveCall(this.id);
