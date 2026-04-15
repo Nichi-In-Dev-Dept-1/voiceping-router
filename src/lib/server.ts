@@ -23,8 +23,10 @@ function debug(msg: string) {
 }
 
 export interface IServer {
-  sendMessageToUser: (mesage: IMessage) => void;
+  sendMessageToUser: (message: IMessage, deliveryId?: numberOrString) => void;
   sendMessageToGroup: (message: IMessage) => void;
+  sendMessageToGroupSubset: (message: IMessage, recipientIds: numberOrString[]) => void;
+  isUserConnected: (userId: numberOrString) => boolean;
 }
 interface IConnection {
   token: string;
@@ -72,14 +74,19 @@ class Server implements IServer {
 
   // IServer Implementation
 
-  public sendMessageToUser(this: Server, msg: IMessage) {
+  public isUserConnected(this: Server, userId: numberOrString): boolean {
+    return this.clients.hasOwnProperty(userId + "");
+  }
+
+  public sendMessageToUser(this: Server, msg: IMessage, deliveryId?: numberOrString) {
     packer.pack(msg, (err, packed) => {
-      const client = this.clients[msg.toId];
+      const dest = deliveryId || msg.toId;
+      const client = this.clients[dest];
       if (!client) {
         if (msg.messageType === MessageType.AUDIO) {
-          debug(`sendMessageToUser type AUDIO NOT-FOUND id ${msg.toId} ${JSON.stringify(msg)}`);
+          debug(`sendMessageToUser type AUDIO NOT-FOUND id ${dest} ${JSON.stringify(msg)}`);
         } else {
-          debug(`sendMessageToUser type NON-AUDIO NOT-FOUND id ${msg.toId} ${JSON.stringify(msg)}`);
+          debug(`sendMessageToUser type NON-AUDIO NOT-FOUND id ${dest} ${JSON.stringify(msg)}`);
         }
         return;
       }
@@ -89,27 +96,43 @@ class Server implements IServer {
 
   public sendMessageToGroup(this: Server, msg: IMessage) {
     this.applyAuthoritativeGroupMeta(msg, () => {
-      const messageIdForLog = msg.messageType === MessageType.TEXT ||
-        msg.messageType === MessageType.INTERACTIVE ||
-        msg.messageType === MessageType.START ||
-        msg.messageType === MessageType.STOP
-        ? msg.messageId
-        : "[omitted]";
-      logger.info(
-        `sendMessageToGroup from: ${msg.fromId} to: ${msg.toId}` +
-        ` messageType: ${msg.messageType} messageId: ${messageIdForLog}`
-      );
-      packer.pack(msg, (err, packed) => {
-        // Echo JoinAcknowledgement back to the sender so they receive the
-        // router-authoritative count (sendDataFromUserToGroup skips the sender by default).
-        let echoToSender = false;
-        try {
-          const meta = JSON.parse(msg.messageId as string);
-          echoToSender = !!(meta && meta.textMessageType === "JoinAcknowledgement");
-        } catch (e) { /* non-JSON messageId — no echo */ }
-        this.sendDataFromUserToGroup(packed, msg.fromId, msg.toId, echoToSender);
+      this.prepareGroupMessage(msg, (packed) => {
+        this.sendDataFromUserToGroup(packed, msg.fromId, msg.toId, this.shouldEchoToSender(msg));
       });
     });
+  }
+
+  public sendMessageToGroupSubset(this: Server, msg: IMessage, recipientIds: numberOrString[]) {
+    this.applyAuthoritativeGroupMeta(msg, () => {
+      this.prepareGroupMessage(msg, (packed) => {
+        this.sendDataFromUserToSubset(packed, msg.fromId, recipientIds, this.shouldEchoToSender(msg));
+      });
+    });
+  }
+
+  private prepareGroupMessage(this: Server, msg: IMessage, callback: (packed: Buffer) => void) {
+    const messageIdForLog = msg.messageType === MessageType.TEXT ||
+      msg.messageType === MessageType.INTERACTIVE ||
+      msg.messageType === MessageType.START ||
+      msg.messageType === MessageType.STOP
+      ? msg.messageId
+      : "[omitted]";
+    logger.info(
+      `prepareGroupMessage from: ${msg.fromId} to: ${msg.toId}` +
+      ` messageType: ${msg.messageType} messageId: ${messageIdForLog}`
+    );
+    packer.pack(msg, (err, packed) => {
+      callback(packed);
+    });
+  }
+
+  private shouldEchoToSender(msg: IMessage): boolean {
+    try {
+      const meta = JSON.parse(msg.messageId as string);
+      return !!(meta && meta.textMessageType === "JoinAcknowledgement");
+    } catch (e) {
+      return false;
+    }
   }
 
   private applyAuthoritativeGroupMeta(this: Server, msg: IMessage, callback: () => void) {
@@ -351,11 +374,19 @@ class Server implements IServer {
         logger.info(`States.getUsersInsideGroup EMPTY id ${userId} groupId ${groupId}`);
         return;
       }
-      for (const recipientId of userIds) {
-        if (!echo && recipientId.toString() === userId.toString()) { continue; }
-        this.sendDataToUser(data, recipientId);
-      }
+      this.sendDataFromUserToSubset(data, userId, userIds, echo);
     });
+  }
+
+  private sendDataFromUserToSubset(
+    this: Server,
+    data: Buffer, userId: numberOrString,
+    recipientIds: numberOrString[], echo: boolean = false
+  ) {
+    for (const recipientId of recipientIds) {
+      if (!echo && recipientId.toString() === userId.toString()) { continue; }
+      this.sendDataToUser(data, recipientId);
+    }
   }
 
   /**

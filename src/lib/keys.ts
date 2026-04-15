@@ -24,6 +24,7 @@ const GROUP_USERS_KEY_FORMAT = "g.%s.u";
 // SETS - active call state (with TTL, so stale data auto-expires)
 const ACTIVE_GROUP_PARTICIPANTS_KEY_FORMAT = "g.%s.ap";
 const ACTIVE_USER_GROUPS_KEY_FORMAT = "u.%s.ag";
+const ACTIVE_CALL_KEY_FORMAT = "u.%s.ac";
 // STRINGS - atomic floor locks (SET NX EX)
 const PRIVATE_FLOOR_KEY_FORMAT = "pf.%s";
 const GROUP_FLOOR_KEY_FORMAT = "gf.%s";
@@ -94,6 +95,10 @@ export class Keys {
 
   public static forActiveGroupsOfUser(userId: numberOrString): string {
     return util.format(ACTIVE_USER_GROUPS_KEY_FORMAT, userId);
+  }
+
+  public static forActiveCallOfUser(userId: numberOrString): string {
+    return util.format(ACTIVE_CALL_KEY_FORMAT, userId);
   }
 
   /**

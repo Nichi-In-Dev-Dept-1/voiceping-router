@@ -21,6 +21,9 @@ const DRY_CLEAN_ENABLED = config.redis.dryCleanEnabled;
 let cleanInterval: NodeJS.Timer;
 let cleanGroup: number = 1;
 
+// TTL for active-call Redis entries — auto-expires stale entries after busyTimeout seconds.
+const ACTIVE_STATE_TTL = Math.ceil(config.group.busyTimeout / 1000);
+
 class Redis {
 
   public static incrementRegisterDevicesCount(callback: (err: Error, registerDevicesCount: number) => void) {
@@ -372,8 +375,6 @@ class Redis {
   // in states.ts, surviving server restarts so participant counts and DropCall signals
   // remain correct across deploys/crashes.
 
-  private static readonly ACTIVE_STATE_TTL = Math.ceil(config.group.busyTimeout / 1000);
-
   public static addActiveParticipantToGroup(
     groupId: numberOrString, userId: numberOrString,
     callback?: (err: Error, count: number) => void
@@ -381,7 +382,7 @@ class Redis {
     const key = Keys.forActiveParticipantsOfGroup(groupId);
     const multi = client.multi();
     multi.sadd(key, userId + "");
-    multi.expire(key, Redis.ACTIVE_STATE_TTL);
+    multi.expire(key, ACTIVE_STATE_TTL);
     multi.exec(function(err) {
       if (err) { if (callback) { return callback(err, 0); } return; }
       client.scard(key, function(err2, count) {
@@ -429,7 +430,7 @@ class Redis {
     const key = Keys.forActiveGroupsOfUser(userId);
     const multi = client.multi();
     multi.sadd(key, groupId + "");
-    multi.expire(key, Redis.ACTIVE_STATE_TTL);
+    multi.expire(key, ACTIVE_STATE_TTL);
     multi.exec(function(err) {
       if (callback) { return callback(err); }
     });
@@ -459,6 +460,54 @@ class Redis {
     callback?: (err: Error) => void
   ) {
     client.del(Keys.forActiveGroupsOfUser(userId), function(err) {
+      if (callback) { return callback(err); }
+    });
+  }
+
+  public static setActiveCall(
+    userId: numberOrString,
+    channelType: number,
+    targetId: numberOrString,
+    isSos: boolean,
+    callback?: (err: Error) => void
+  ) {
+    const key = Keys.forActiveCallOfUser(userId);
+    const multi = client.multi();
+    multi.hmset(
+      key,
+      "channelType", channelType.toString(),
+      "targetId", targetId.toString(),
+      "isSos", isSos.toString()
+    );
+    multi.expire(key, ACTIVE_STATE_TTL);
+    multi.exec(function(err) {
+      if (callback) { return callback(err); }
+    });
+  }
+
+  public static getActiveCall(
+    userId: numberOrString,
+    callback: (err: Error, details: { channelType: number; targetId: string; isSos: boolean } | null) => void
+  ) {
+    client.hgetall(Keys.forActiveCallOfUser(userId), function(err, obj) {
+      if (err) { return callback(err, null); }
+      if (!obj || Object.keys(obj).length === 0) { return callback(null, null); }
+      return callback(null, {
+        channelType: parseInt(obj.channelType, 10),
+        isSos: obj.isSos === "true",
+        targetId: obj.targetId
+      });
+    });
+  }
+
+  public static clearActiveCall(userId: numberOrString, callback?: (err: Error) => void) {
+    client.del(Keys.forActiveCallOfUser(userId), function(err) {
+      if (callback) { return callback(err); }
+    });
+  }
+
+  public static refreshActiveCall(userId: numberOrString, callback?: (err: Error) => void) {
+    client.expire(Keys.forActiveCallOfUser(userId), ACTIVE_STATE_TTL, function(err) {
       if (callback) { return callback(err); }
     });
   }
@@ -495,6 +544,22 @@ class Redis {
         if (err2) { return callback(err2, false, null); }
         return callback(null, false, currentOwner || "");
       });
+    });
+  }
+
+  /**
+   * Read-only check: return the current owner of a private-channel floor without
+   * modifying any state.  Use this instead of acquirePrivateFloor when you only
+   * need to know who holds the floor (e.g. audio-packet ownership validation).
+   */
+  public static getPrivateFloorOwner(
+    sortedPairKey: string,
+    callback: (err: Error, owner: string | null) => void
+  ): void {
+    const key = Keys.forPrivateFloor(sortedPairKey);
+    client.get(key, function(err: Error, owner: string) {
+      if (err) { return callback(err, null); }
+      return callback(null, owner);
     });
   }
 
