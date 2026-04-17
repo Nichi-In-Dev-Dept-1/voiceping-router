@@ -41,7 +41,14 @@ const groupSosState: { [groupId: string]: boolean } = {};
 // undefined  → no restriction (normal group call, broadcast to all)
 // []         → all members were busy; drop AUDIO until floor released
 // [id, ...]  → subset delivery; AUDIO goes only to these members
-const groupFloorRecipients: { [groupId: string]: string[] } = {};
+interface IGroupFloorRecipientSession {
+  ownerId: string;
+  recipients: string[];
+  sessionEpoch: number;
+}
+const groupFloorRecipients: { [groupId: string]: IGroupFloorRecipientSession } = {};
+const groupFloorEpochById: { [groupId: string]: number } = {};
+const groupFloorKeysByUser: { [userId: string]: Set<string> } = {};
 
 // Floor TTL: max call duration + a generous buffer (seconds).
 const PRIVATE_FLOOR_TTL_SEC = Math.ceil((config.group.busyTimeout / 1000) + 30);
@@ -136,7 +143,18 @@ export default class States {
   ) {
     groupId = groupId + "";
     if (!memored) {
-      return callback(null, usersInsideGroupsSet[groupId]);
+      const inMemory = usersInsideGroupsSet[groupId];
+      if (inMemory && (inMemory as any[]).length > 0) {
+        return callback(null, inMemory);
+      }
+      // In-memory empty — fall back to Redis (handles reconnect race where
+      // registerClient's async addUserToGroup hasn't completed yet).
+      return Redis.getUsersInsideGroup(groupId, (err, userIds) => {
+        if (!err && userIds && userIds.length > 0) {
+          usersInsideGroupsSet[groupId] = userIds;
+        }
+        return callback(null, userIds);
+      });
     } else {
       memored.read(Keys.forUsersInsideGroup(groupId), function(err, userIds) {
         usersInsideGroupsSet[groupId] = userIds;
@@ -253,6 +271,10 @@ export default class States {
         delete userGroupCallState[userId];
       }
       Redis.removeActiveGroupForUser(userId, groupId);
+      // Clear the u.X.ac Redis key so stale "inCall" state doesn't block future calls.
+      if (activeCallGroupsOfUsersSet[userId].length === 0) {
+        Redis.clearActiveCall(userId);
+      }
     });
     return States.clearActiveParticipantsOfGroup(groupId, callback);
   }
@@ -428,8 +450,42 @@ export default class States {
       if (err) {
         return callback(null, { inCall: false, channelType: 0, targetId: "", isSos: false });
       }
-      if (ac && ac.channelType === 1) {
-        return callback(null, { inCall: true, ...ac });
+      if (ac && (ac.channelType === 1 || ac.channelType === 2)) {
+        // For group calls: validate against in-memory state.  If in-memory shows no active
+        // group but Redis says inCall=true, the Redis entry is stale (server restart while
+        // the call was active, or CallEndedForAll arrived before the key was cleared).
+        // Clear it so subsequent calls are not incorrectly rejected as "busy".
+        if (ac.channelType === 2) {
+          const userGroups = (activeCallGroupsOfUsersSet[uid] || []);
+          if (userGroups.length === 0) {
+            Redis.clearActiveCall(userId);
+            return callback(null, { inCall: false, channelType: 0, targetId: "", isSos: false });
+          }
+        }
+        // For private calls: validate against in-memory state and check for invalid targets.
+        // If Redis says in a private call with target "00000" or similar invalid ID, the entry
+        // is stale (disconnected peer or cleanup failure). Clear it so calls can proceed.
+        if (ac.channelType === 1) {
+          const privateCallState = userPrivateCallState[uid];
+          const targetId = (ac.targetId || "").toString();
+
+          // Check if target is invalid (00000, 0, or empty) or in-memory state doesn't match
+          if (!targetId || targetId === "00000" || targetId === "0" ||
+              !privateCallState || privateCallState.peerId.toString() !== targetId) {
+            Redis.clearActiveCall(userId);
+            // Also clear in-memory state if it exists
+            if (privateCallState) {
+              delete userPrivateCallState[uid];
+            }
+            return callback(null, { inCall: false, channelType: 0, targetId: "", isSos: false });
+          }
+        }
+        return callback(null, {
+          channelType: ac.channelType,
+          inCall: true,
+          isSos: !!ac.isSos,
+          targetId: (ac.targetId || "") + ""
+        });
       }
       return callback(null, { inCall: false, channelType: 0, targetId: "", isSos: false });
     });
@@ -455,18 +511,45 @@ export default class States {
   }
 
   /** Set the subset of recipients that actually received START for the current group floor session. */
-  public static setGroupFloorRecipients(groupId: numberOrString, recipients: numberOrString[]): void {
-    groupFloorRecipients[groupId + ""] = recipients.map((r) => r + "");
+  public static setGroupFloorRecipients(
+    groupId: numberOrString,
+    ownerId: numberOrString,
+    recipients: numberOrString[]
+  ): number {
+    const gid = groupId + "";
+    const epoch = (groupFloorEpochById[gid] || 0) + 1;
+    groupFloorEpochById[gid] = epoch;
+    groupFloorRecipients[gid] = {
+      ownerId: ownerId + "",
+      recipients: recipients.map((r) => r + ""),
+      sessionEpoch: epoch
+    };
+    return epoch;
   }
 
   /** Returns the recipient subset, or undefined if there is no restriction (normal call). */
-  public static getGroupFloorRecipients(groupId: numberOrString): string[] | undefined {
-    return groupFloorRecipients[groupId + ""];
+  public static getGroupFloorRecipients(
+    groupId: numberOrString,
+    ownerId?: numberOrString
+  ): string[] | undefined {
+    const session = groupFloorRecipients[groupId + ""];
+    if (!session) { return undefined; }
+    if (ownerId !== undefined && session.ownerId !== ownerId + "") { return undefined; }
+    return session.recipients;
   }
 
   /** Clear recipient restriction when the floor is released. */
-  public static clearGroupFloorRecipients(groupId: numberOrString): void {
-    delete groupFloorRecipients[groupId + ""];
+  public static clearGroupFloorRecipients(
+    groupId: numberOrString,
+    ownerId?: numberOrString,
+    sessionEpoch?: number
+  ): void {
+    const gid = groupId + "";
+    const session = groupFloorRecipients[gid];
+    if (!session) { return; }
+    if (ownerId !== undefined && session.ownerId !== ownerId + "") { return; }
+    if (sessionEpoch !== undefined && session.sessionEpoch !== sessionEpoch) { return; }
+    delete groupFloorRecipients[gid];
   }
 
   public static setGroupSos(groupId: numberOrString, isSos: boolean) {
@@ -482,6 +565,7 @@ export default class States {
     callback?: (err: Error, releasedGroups: Array<number|string>) => void
   ) {
     userId = userId + "";
+    const userIdStr = userId + "";
     const releasedGroups: Array<number|string> = [];
     Object.keys(groupsCurrentMessagesSet).forEach((groupId) => {
       const message = groupsCurrentMessagesSet[groupId];
@@ -495,6 +579,16 @@ export default class States {
         }
       }
     });
+    const ownedGroupFloors = groupFloorKeysByUser[userIdStr];
+    if (ownedGroupFloors && ownedGroupFloors.size > 0) {
+      ownedGroupFloors.forEach((groupId) => {
+        Redis.releaseGroupFloor(groupId, userIdStr, () => {
+          States.clearGroupFloorRecipients(groupId, userIdStr);
+          States.removeBusyStateOfGroup(groupId);
+        });
+      });
+      delete groupFloorKeysByUser[userIdStr];
+    }
     if (callback) { return callback(null, releasedGroups); }
     return;
   }
@@ -675,16 +769,21 @@ export default class States {
   ) {
     groupId = groupId + "";
     userId = userId + "";
+    const groupIdStr = groupId + "";
+    const userIdStr = userId + "";
     // Use atomic Redis SET NX EX — only ONE worker across the cluster can win.
-    Redis.acquireGroupFloor(groupId, userId, GROUP_FLOOR_TTL_SEC, (err, acquired, currentOwner) => {
+    Redis.acquireGroupFloor(groupIdStr, userIdStr, GROUP_FLOOR_TTL_SEC, (err, acquired, currentOwner) => {
       if (err) { return callback(err, false, 0); }
       if (acquired) {
+        if (!groupFloorKeysByUser[userIdStr]) { groupFloorKeysByUser[userIdStr] = new Set(); }
+        groupFloorKeysByUser[userIdStr].add(groupIdStr);
         // Mirror into local message state so the rest of the code (audioTime
         // inspection, floor-owner checks) keeps working as before.
-        States.setBusyStateOfGroup(groupId, userId, (setErr) => {
+        States.setBusyStateOfGroup(groupIdStr, userIdStr, (setErr) => {
           if (setErr) {
             // Roll back the Redis lock so we don't leave a phantom floor.
-            Redis.releaseGroupFloor(groupId, userId + "");
+            Redis.releaseGroupFloor(groupIdStr, userIdStr);
+            groupFloorKeysByUser[userIdStr].delete(groupIdStr);
             return callback(setErr, false, userId);
           }
           return callback(null, true, userId);
@@ -707,7 +806,13 @@ export default class States {
         if (callback) { return callback(err, false); }
         return;
       }
-      States.updateAudioTimeOfGroup(groupId, callback);
+      Redis.refreshGroupFloor(groupId, userId + "", GROUP_FLOOR_TTL_SEC, (refreshErr) => {
+        if (refreshErr) {
+          if (callback) { return callback(refreshErr, false); }
+          return;
+        }
+        States.updateAudioTimeOfGroup(groupId, callback);
+      });
     });
   }
 
@@ -718,15 +823,23 @@ export default class States {
   ) {
     groupId = groupId + "";
     userId = userId + "";
+    const groupIdStr = groupId + "";
+    const userIdStr = userId + "";
     // Atomically release the Redis lock (owner-only Lua script), then clear
     // the local mirror regardless so stale in-memory state doesn't linger.
-    Redis.releaseGroupFloor(groupId, userId, (redisErr, released) => {
+    Redis.releaseGroupFloor(groupIdStr, userIdStr, (redisErr, released) => {
       if (redisErr) {
         debug(`releaseFloorOfGroup Redis error groupId:${groupId} userId:${userId} err:${redisErr}`);
       }
+      if (groupFloorKeysByUser[userIdStr]) {
+        groupFloorKeysByUser[userIdStr].delete(groupIdStr);
+        if (groupFloorKeysByUser[userIdStr].size === 0) {
+          delete groupFloorKeysByUser[userIdStr];
+        }
+      }
       // Clear local mirror unconditionally — even if redis said "not owner"
       // (e.g. TTL expired) we still want to clean up local state.
-      States.removeBusyStateOfGroup(groupId, function(removeErr) {
+      States.removeBusyStateOfGroup(groupIdStr, function(removeErr) {
         if (callback) { return callback(removeErr || null, released || false); }
       });
     });

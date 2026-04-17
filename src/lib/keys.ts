@@ -28,6 +28,9 @@ const ACTIVE_CALL_KEY_FORMAT = "u.%s.ac";
 // STRINGS - atomic floor locks (SET NX EX)
 const PRIVATE_FLOOR_KEY_FORMAT = "pf.%s";
 const GROUP_FLOOR_KEY_FORMAT = "gf.%s";
+const SIGNALING_SEQ_KEY_FORMAT = "u.%s.ss";
+const SIGNALING_OUTBOX_KEY_FORMAT = "u.%s.so";
+const SIGNALING_OPERATION_KEY_FORMAT = "op.%s";
 
 const UUIDS_KEY = util.format(UUIDS_KEY_FORMAT, NETWORK);
 
@@ -113,6 +116,18 @@ export class Keys {
   /** Key for the atomic group floor lock. */
   public static forGroupFloor(groupId: numberOrString): string {
     return util.format(GROUP_FLOOR_KEY_FORMAT, groupId);
+  }
+
+  public static forSignalingSeq(userId: numberOrString): string {
+    return util.format(SIGNALING_SEQ_KEY_FORMAT, userId);
+  }
+
+  public static forSignalingOutbox(userId: numberOrString): string {
+    return util.format(SIGNALING_OUTBOX_KEY_FORMAT, userId);
+  }
+
+  public static forSignalingOperation(operationId: string): string {
+    return util.format(SIGNALING_OPERATION_KEY_FORMAT, operationId);
   }
 
   // HASHES

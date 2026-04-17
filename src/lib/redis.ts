@@ -23,8 +23,54 @@ let cleanGroup: number = 1;
 
 // TTL for active-call Redis entries — auto-expires stale entries after busyTimeout seconds.
 const ACTIVE_STATE_TTL = Math.ceil(config.group.busyTimeout / 1000);
+const SIGNALING_OUTBOX_MAX_ITEMS = 200;
+const SIGNALING_OPERATION_TTL_SEC = 120;
 
 class Redis {
+  public static nextSignalingSeq(
+    userId: numberOrString,
+    callback: (err: Error, seq: number) => void
+  ): void {
+    client.incr(Keys.forSignalingSeq(userId), (err, seq) => {
+      if (err) { return callback(err, 0); }
+      return callback(null, Number(seq || 0));
+    });
+  }
+
+  public static pushSignalingOutboxEvent(
+    userId: numberOrString,
+    serializedEvent: string,
+    callback?: (err: Error, succeed: boolean) => void
+  ): void {
+    const key = Keys.forSignalingOutbox(userId);
+    const multi = client.multi();
+    multi.lpush(key, serializedEvent);
+    multi.ltrim(key, 0, SIGNALING_OUTBOX_MAX_ITEMS - 1);
+    multi.exec((err) => {
+      if (callback) { return callback(err || null, !err); }
+    });
+  }
+
+  public static getSignalingOutboxEvents(
+    userId: numberOrString,
+    callback: (err: Error, events: string[]) => void
+  ): void {
+    client.lrange(Keys.forSignalingOutbox(userId), 0, SIGNALING_OUTBOX_MAX_ITEMS - 1, (err, events) => {
+      if (err) { return callback(err, []); }
+      return callback(null, events || []);
+    });
+  }
+
+  public static reserveOperation(
+    operationId: string,
+    ttlSec: number = SIGNALING_OPERATION_TTL_SEC,
+    callback?: (err: Error, reserved: boolean) => void
+  ): void {
+    const key = Keys.forSignalingOperation(operationId);
+    (client as any).set(key, "1", "NX", "EX", ttlSec, (err: Error, reply: string) => {
+      if (callback) { return callback(err || null, reply === "OK"); }
+    });
+  }
 
   public static incrementRegisterDevicesCount(callback: (err: Error, registerDevicesCount: number) => void) {
     client.incr(Keys.forRegisterDevicesCount, function(err, registerDevicesCount) {

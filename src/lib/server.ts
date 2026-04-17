@@ -17,6 +17,9 @@ import States from "./states";
 import { IMessage, numberOrString } from "./types";
 
 const WORKER_NUMBER = cluster.worker ? cluster.worker.id : "-";
+const REPLAY_MAX_AGE_MS = 10_000; // Reduced from 20_000 for faster cleanup
+const REPLAY_MAX_EVENTS = 20; // Reduced from 40 for lower memory usage
+const MESSAGE_BATCH_SIZE = 50; // Batch processing for better throughput
 const dbug1 = dbug("vp:router");
 function debug(msg: string) {
   dbug1((cluster.worker ? `worker ${cluster.worker.id} ` : "") + msg);
@@ -32,6 +35,7 @@ interface IConnection {
   token: string;
   deviceId: string;
   key: string;
+  lastAckedSeq?: number;
 }
 
 // class Server implements IServer {
@@ -79,18 +83,40 @@ class Server implements IServer {
   }
 
   public sendMessageToUser(this: Server, msg: IMessage, deliveryId?: numberOrString) {
-    packer.pack(msg, (err, packed) => {
-      const dest = deliveryId || msg.toId;
-      const client = this.clients[dest];
-      if (!client) {
-        if (msg.messageType === MessageType.AUDIO) {
-          debug(`sendMessageToUser type AUDIO NOT-FOUND id ${dest} ${JSON.stringify(msg)}`);
-        } else {
-          debug(`sendMessageToUser type NON-AUDIO NOT-FOUND id ${dest} ${JSON.stringify(msg)}`);
+    const dest = deliveryId || msg.toId;
+    const persistAndSend = (enrichedMsg: IMessage) => {
+      packer.pack(enrichedMsg, (err, packed) => {
+        const client = this.clients[dest];
+        if (!client) {
+          if (msg.messageType === MessageType.AUDIO) {
+            debug(`sendMessageToUser type AUDIO NOT-FOUND id ${dest} ${JSON.stringify(msg)}`);
+          } else {
+            debug(`sendMessageToUser type NON-AUDIO NOT-FOUND id ${dest} ${JSON.stringify(msg)}`);
+          }
+          return;
         }
+        client.send(packed);
+      });
+    };
+
+    if (!this.shouldPersistForReplay(msg)) {
+      persistAndSend(msg);
+      return;
+    }
+
+    Redis.nextSignalingSeq(dest, (seqErr, seq) => {
+      if (seqErr) {
+        logger.error(`sendMessageToUser nextSignalingSeq error dest ${dest} err ${seqErr}`);
+        persistAndSend(msg);
         return;
       }
-      client.send(packed);
+      const enriched = this.attachServerSequence(msg, seq);
+      Redis.pushSignalingOutboxEvent(dest, JSON.stringify(enriched), (outboxErr) => {
+        if (outboxErr) {
+          logger.error(`sendMessageToUser pushSignalingOutboxEvent error dest ${dest} err ${outboxErr}`);
+        }
+        persistAndSend(enriched);
+      });
     });
   }
 
@@ -270,6 +296,132 @@ class Server implements IServer {
                 ` sockets ${Object.keys(this.sockets).length} wss ${this.wss.clients.size}`);
   }
 
+  private shouldPersistForReplay(this: Server, msg: IMessage): boolean {
+    if (msg.messageType === MessageType.AUDIO) { return false; }
+    if (msg.messageType === MessageType.DELIVERED || msg.messageType === MessageType.READ) { return false; }
+    if (msg.messageType === MessageType.CONNECTION || msg.messageType === MessageType.CONNECTION_ACK) { return false; }
+    return true;
+  }
+
+  private attachServerSequence(this: Server, msg: IMessage, seq: number): IMessage {
+    const enriched: IMessage = { ...msg };
+    const replayStoredAt = Date.now();
+    if (enriched.messageId && typeof enriched.messageId === "string") {
+      try {
+        const meta = JSON.parse(enriched.messageId);
+        if (meta && typeof meta === "object") {
+          meta.serverSeq = seq;
+          meta.replayStoredAt = replayStoredAt;
+          enriched.messageId = JSON.stringify(meta);
+          return enriched;
+        }
+      } catch (e) {
+        // Non-JSON messageId is valid; fallback to payload injection below.
+      }
+    }
+    try {
+      const payload = typeof enriched.payload === "string"
+        ? JSON.parse(enriched.payload)
+        : enriched.payload;
+      if (payload && typeof payload === "object") {
+        payload.serverSeq = seq;
+        payload.replayStoredAt = replayStoredAt;
+        enriched.payload = JSON.stringify(payload);
+      }
+    } catch (e) {
+      // Keep original payload when not JSON.
+    }
+    return enriched;
+  }
+
+  private extractServerSeq(this: Server, msg: IMessage): number {
+    if (msg.messageId && typeof msg.messageId === "string") {
+      try {
+        const meta = JSON.parse(msg.messageId);
+        if (meta && typeof meta.serverSeq === "number") {
+          return meta.serverSeq;
+        }
+      } catch (e) { /* no-op */ }
+    }
+    if (msg.payload && typeof msg.payload === "string") {
+      try {
+        const payload = JSON.parse(msg.payload);
+        if (payload && typeof payload.serverSeq === "number") {
+          return payload.serverSeq;
+        }
+      } catch (e) { /* no-op */ }
+    }
+    return 0;
+  }
+
+  private extractReplayStoredAt(this: Server, msg: IMessage): number {
+    if (msg.messageId && typeof msg.messageId === "string") {
+      try {
+        const meta = JSON.parse(msg.messageId);
+        if (meta && typeof meta.replayStoredAt === "number") {
+          return meta.replayStoredAt;
+        }
+      } catch (e) { /* no-op */ }
+    }
+    if (msg.payload && typeof msg.payload === "string") {
+      try {
+        const payload = JSON.parse(msg.payload);
+        if (payload && typeof payload.replayStoredAt === "number") {
+          return payload.replayStoredAt;
+        }
+      } catch (e) { /* no-op */ }
+    }
+    return 0;
+  }
+
+  private shouldReplayMessage(this: Server, msg: IMessage): boolean {
+    if (msg.messageType === MessageType.START_ACK ||
+        msg.messageType === MessageType.START_FAILED ||
+        msg.messageType === MessageType.STOP_ACK) {
+      return true;
+    }
+    if (msg.messageType !== MessageType.TEXT) {
+      return false;
+    }
+    if (!msg.messageId || typeof msg.messageId !== "string") {
+      return false;
+    }
+    try {
+      const meta = JSON.parse(msg.messageId);
+      const textType = meta && meta.textMessageType;
+      return textType === "BusyEvent" || textType === "DropCall" || textType === "CallEndedForAll";
+    } catch (e) {
+      return false;
+    }
+  }
+
+  private replayQueuedSignals(this: Server, userId: numberOrString, lastAckedSeq: number): void {
+    Redis.getSignalingOutboxEvents(userId, (err, events) => {
+      if (err || !events || events.length === 0) { return; }
+      const now = Date.now();
+      const replay = events
+        .map((item) => {
+          try { return JSON.parse(item) as IMessage; } catch (e) { return null; }
+        })
+        .filter((msg): msg is IMessage => !!msg)
+        .filter((msg) => this.extractServerSeq(msg) > lastAckedSeq)
+        .filter((msg) => this.shouldReplayMessage(msg))
+        .filter((msg) => {
+          const storedAt = this.extractReplayStoredAt(msg);
+          return storedAt > 0 && now - storedAt <= REPLAY_MAX_AGE_MS;
+        })
+        .sort((a, b) => this.extractServerSeq(a) - this.extractServerSeq(b));
+      replay.slice(-REPLAY_MAX_EVENTS).forEach((msg) => {
+        packer.pack(msg, (packErr, packed) => {
+          if (packErr) { return; }
+          const client = this.clients[userId];
+          if (!client) { return; }
+          client.send(packed);
+        });
+      });
+    });
+  }
+
   private getConnectionFromHeaders(headers, log: boolean = false): IConnection {
     let protocols = headers["sec-websocket-protocol"];
     if (protocols) { protocols = protocols.split(", "); }
@@ -277,7 +429,8 @@ class Server implements IServer {
     const deviceId0  = protocols ? protocols[1] : null;
     const token = headers.token || headers.voicepingtoken || token0;
     const deviceId = headers.device_id || headers.deviceid || deviceId0 || token;
-    const connection = { token, deviceId, key: headers["sec-websocket-key"] };
+    const lastAckedSeq = Number(headers["x-last-acked-seq"] || 0);
+    const connection = { token, deviceId, key: headers["sec-websocket-key"], lastAckedSeq };
     return connection;
   }
 
@@ -326,8 +479,10 @@ class Server implements IServer {
         const deviceId = connection.deviceId;
         const userId = user.uid;
         const key = connection.key;
+        const lastAckedSeq = Number(connection.lastAckedSeq || 0);
 
         this.registerClient(ws, userId, key, deviceId, user);
+        this.replayQueuedSignals(userId, lastAckedSeq);
       }).catch((err) => {
         logger.error(`handleWssConnection getUserFromToken ERR ${err}`);
       });

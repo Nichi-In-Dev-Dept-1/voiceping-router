@@ -256,6 +256,11 @@ export default class Client extends EventEmitter {
   }
 
   private handlePrivateStartMessage(this: Client, msg: IMessage) {
+    const operationId = this.extractOperationId(msg);
+    this.withOperationDedupe(operationId, msg, "START", () => this.handlePrivateStartMessageCore(msg));
+  }
+
+  private handlePrivateStartMessageCore(this: Client, msg: IMessage) {
     debug(`id ${this.id} handlePrivateStartMessage ${JSON.stringify(msg)}`);
 
     const newCallIsSos = this.parseIsSosCall(msg);
@@ -496,17 +501,22 @@ export default class Client extends EventEmitter {
 
   private acknowledgePrivateStartMessage(this: Client, msg: IMessage) {
     const payload = msg.payload || "Acknowledged";
-    this.message({
+    this.server.sendMessageToUser({
       ...msg,
       channelType: msg.channelType,
       messageType: MessageType.START_ACK,
       payload
-    });
+    }, msg.fromId);
   }
 
   // PRIVATE & GROUP (USED BY BOTH) MESSAGE HANDLERS
 
   private handleStopMessage(this: Client, msg: IMessage) {
+    const operationId = this.extractOperationId(msg);
+    this.withOperationDedupe(operationId, msg, "STOP", () => this.handleStopMessageCore(msg));
+  }
+
+  private handleStopMessageCore(this: Client, msg: IMessage) {
     logger.info(`handleStopMessage id ${msg.fromId} to ${msg.toId} messageType ${msg.messageType}`);
 
     if (msg.channelType === ChannelType.GROUP) {
@@ -574,7 +584,7 @@ export default class Client extends EventEmitter {
         States.removeCurrentMessageOfUser(msg.fromId);
         if (msg.channelType === ChannelType.GROUP) {
           States.releaseFloorOfGroup(msg.toId, msg.fromId, () => {
-            States.clearGroupFloorRecipients(msg.toId);
+            States.clearGroupFloorRecipients(msg.toId, msg.fromId);
             States.removeCurrentMessageOfGroup(msg.toId);
           });
         } else {
@@ -598,12 +608,12 @@ export default class Client extends EventEmitter {
 
   private acknowledgeStopMessage(this: Client, msg: IMessage, messageId: string) {
     debug(`id ${this.id} Response STOP_ACK`);
-    this.message({
+    this.server.sendMessageToUser({
       ...msg,
       messageId,
       messageType: MessageType.STOP_ACK,
       payload: "Acknowledged"
-    });
+    }, msg.fromId);
   }
 
   private handleDeliveredMessage(this: Client, msg: IMessage) {
@@ -750,10 +760,29 @@ export default class Client extends EventEmitter {
         });
         return;
       case "CallEndedForAll":
-        States.clearActiveCallGroup(groupId, () => {
-          meta.membersInCall = 0;
-          msg.messageId = JSON.stringify(meta);
-          callback();
+        // Get all users in the group before clearing
+        States.getUsersInsideGroup(groupId, (err, userIds) => {
+          if (!err && userIds && userIds.length > 0) {
+            // Clear ALL call state for every group member (production-ready cleanup)
+            userIds.forEach((userId) => {
+              // 1. Clear Redis active call entry
+              States.clearUserActiveCall(userId);
+              // 2. Clear private call state if exists
+              States.clearUserPrivateCall(userId);
+              // 3. Remove from all active call groups
+              States.removeActiveParticipantFromAllGroups(userId);
+              // 4. Release any floor ownership
+              States.releaseFloorOwnershipForUser(userId);
+              States.releasePrivateFloorOwnershipForUser(userId);
+            });
+          }
+
+          // 5. Clear the group call state
+          States.clearActiveCallGroup(groupId, () => {
+            meta.membersInCall = 0;
+            msg.messageId = JSON.stringify(meta);
+            callback();
+          });
         });
         return;
       default:
@@ -828,7 +857,7 @@ export default class Client extends EventEmitter {
         // undefined → normal call, broadcast to everyone in the group.
         // [] (empty) → all members were busy; drop this audio packet.
         // [...ids]  → partial availability; deliver only to the members who received START.
-        const recipients = States.getGroupFloorRecipients(msg.toId);
+        const recipients = States.getGroupFloorRecipients(msg.toId, msg.fromId);
         if (recipients !== undefined) {
           if (recipients.length === 0) {
             debug(`id: ${this.id} dropping AUDIO from ${msg.fromId} — group ${msg.toId} recipients empty (all-busy)`);
@@ -843,102 +872,103 @@ export default class Client extends EventEmitter {
   }
 
   private handleGroupStartMessage(this: Client, msg: IMessage) {
-    // Register the in-flight START before any async work so that a STOP arriving
-    // during floor acquisition (quick tap-and-release) can be buffered instead of
-    // silently dropped.
+    const operationId = this.extractOperationId(msg);
+    this.withOperationDedupe(operationId, msg, "START", () => this.handleGroupStartMessageCore(msg));
+  }
+
+  private handleGroupStartMessageCore(this: Client, msg: IMessage) {
+    // Register the in-flight START so a quick-release STOP can be buffered.
     const startStopKey = `${msg.fromId}_${msg.toId}`;
     this.pendingGroupStart.set(startStopKey, msg);
+    const isSos = this.parseIsSosCall(msg);
+    const senderIdStr = msg.fromId.toString();
 
-    this.acknowledgeGroupStartMessage(msg, (err, acknowledged) => {
-      this.pendingGroupStart.delete(startStopKey);
+    // ── Step 1: Check sender membership + member availability BEFORE acquiring the floor.
+    // This avoids sending START_ACK and then immediately sending BusyEvent when all
+    // members are already occupied — which caused a visible "flash" in the caller's UI.
+    States.getUsersInsideGroup(msg.toId, (err1, userIds1) => {
+      debug(`handleGroupStartMessage - getUsersInsideGroup groupId: ${msg.toId} users: ${JSON.stringify(userIds1)}`);
 
-      if (err) { debug(`id: ${this.id} acknowledgeGroupMessage: groupId: ${msg.toId}` +
-                       ` id: ${msg.fromId} err: ${err}`); }
-      if (!acknowledged) {
-        // Floor was busy or START failed — discard any buffered STOP.
+      const isSenderInGroup = (userIds1 || []).some((u) => u.toString() === senderIdStr);
+      if (!isSenderInGroup) {
+        this.pendingGroupStart.delete(startStopKey);
         this.pendingGroupStop.delete(startStopKey);
+        this.send27ToMe(msg);
+        this.sendStartFailedToMe(msg);
         return;
       }
 
-      const isSos = this.parseIsSosCall(msg);
-      States.setGroupSos(msg.toId, isSos);
-      States.setUserGroupCallState(msg.fromId, msg.toId, isSos);
-      States.addUserToActiveCallGroup(msg.fromId, msg.toId, isSos);
+      // Overlap call filtering: check every member's call state in parallel.
+      const checkPromises = (userIds1 || []).map((uid) => {
+        if (uid.toString() === senderIdStr) { return Q.resolve(null); }
+        const deferred = Q.defer();
+        States.getCallDetailsForUser(uid, (detailsErr, details) => {
+          deferred.resolve({ uid, details });
+        });
+        return deferred.promise;
+      });
 
-      Recorder.start(msg);
+      Q.all(checkPromises).then((results) => {
+        const availableRecipients: numberOrString[] = [];
+        const overrides: Array<(done: () => void) => void> = [];
 
-      // Block all AUDIO immediately so no packets leak while the async member check runs.
-      // Will be updated to the actual subset (or cleared) once availability is known.
-      States.setGroupFloorRecipients(msg.toId, []);
-
-      States.getUsersInsideGroup(msg.toId, (err1, userIds1) => {
-        debug(`handleGroupStartMessage - getUsersInsideGroup groupId: ${msg.toId} users: ${JSON.stringify(userIds1)}`);
-        const senderIdStr = msg.fromId.toString();
-        const isSenderInGroup = (userIds1 || []).some((u) => u.toString() === senderIdStr);
-
-        if (!isSenderInGroup) {
-          this.send27ToMe(msg);
-          this.sendStartFailedToMe(msg);
-        }
-
-        // Overlap call filtering: Check every member's global state in Redis (asynchronously)
-        const checkPromises = (userIds1 || []).map((uid) => {
-          if (uid.toString() === senderIdStr) { return Q.resolve(null); }
-          const deferred = Q.defer();
-          States.getCallDetailsForUser(uid, (detailsErr, details) => {
-            deferred.resolve({ uid, details });
-          });
-          return deferred.promise;
+        results.forEach((res: any) => {
+          if (!res) { return; }
+          const { uid, details } = res;
+          if (!details.inCall) {
+            availableRecipients.push(uid);
+          } else if (details.channelType === 2 && details.targetId === msg.toId.toString()) {
+            // Already in this same group call — include them so they hear the new floor owner.
+            availableRecipients.push(uid);
+          } else if (isSos && !details.isSos) {
+            // SOS overrides a normal call in a different channel.
+            availableRecipients.push(uid);
+            overrides.push((done) => this.executeCallOverrideForUser(uid, details, done));
+          } else {
+            logger.info(`handleGroupStartMessage: skipping busy member ${uid}` +
+                        ` (sos=${details.isSos} newSos=${isSos}` +
+                        ` theirChannel=${details.channelType} theirTarget=${details.targetId})`);
+          }
         });
 
-        Q.all(checkPromises).then((results) => {
-          const availableRecipients: numberOrString[] = [];
-          const overrides: Array<(done: () => void) => void> = [];
+        // ── Step 2: If ALL members are busy, reject immediately — no floor acquired yet.
+        if (availableRecipients.length === 0 && overrides.length === 0) {
+          this.pendingGroupStart.delete(startStopKey);
+          this.pendingGroupStop.delete(startStopKey);
+          logger.info(`handleGroupStartMessage: all members busy for group ${msg.toId}` +
+                      ` — rejecting ${msg.fromId} before floor acquisition`);
+          this.sendStartFailedToMe(msg);
+          this.sendBusyEventText(msg, "Busy");
+          return;
+        }
 
-          results.forEach((res: any) => {
-            if (!res) { return; }
-            const { uid, details } = res;
-            if (!details.inCall) {
-              // Member is free — include them.
-              availableRecipients.push(uid);
-            } else if (details.channelType === 2 && details.targetId === msg.toId.toString()) {
-              // Member is already in THIS same group call — they should receive the
-              // new floor owner's audio.  Do NOT treat this as "busy" — that would
-              // lock out everyone already in the call from hearing new PTT presses.
-              availableRecipients.push(uid);
-            } else if (isSos && !details.isSos) {
-              // SOS overrides a normal call in a different channel.
-              availableRecipients.push(uid);
-              overrides.push((done) => this.executeCallOverrideForUser(uid, details, done));
-            } else {
-              logger.info(`handleGroupStartMessage: skipping busy member ${uid}` +
-                          ` (sos=${details.isSos} newSos=${isSos}` +
-                          ` theirChannel=${details.channelType} theirTarget=${details.targetId})`);
-            }
-          });
+        // ── Step 3: At least one member is available — acquire the floor and proceed.
+        this.acknowledgeGroupStartMessage(msg, (err, acknowledged) => {
+          this.pendingGroupStart.delete(startStopKey);
+
+          if (err) { debug(`id: ${this.id} acknowledgeGroupMessage: groupId: ${msg.toId}` +
+                           ` id: ${msg.fromId} err: ${err}`); }
+          if (!acknowledged) {
+            // Floor was busy (race with another caller) — discard any buffered STOP.
+            this.pendingGroupStop.delete(startStopKey);
+            return;
+          }
+
+          States.setGroupSos(msg.toId, isSos);
+          States.setUserGroupCallState(msg.fromId, msg.toId, isSos);
+          States.addUserToActiveCallGroup(msg.fromId, msg.toId, isSos);
+
+          Recorder.start(msg);
+
+          // Block AUDIO until recipient list is committed (avoids early audio leaks).
+          const floorRecipientEpoch = States.setGroupFloorRecipients(msg.toId, msg.fromId, []);
 
           const proceed = () => {
-            if (availableRecipients.length > 0) {
-              // Update recipients to the actual subset so AUDIO is delivered only to them.
-              States.setGroupFloorRecipients(msg.toId, availableRecipients.map((r) => r + ""));
-              this.server.sendMessageToGroupSubset(msg, availableRecipients);
-            } else {
-              // All members are busy — notify the caller, release the floor, and undo
-              // the group-state entries that were created at the top of this handler
-              // (addUserToActiveCallGroup / setUserGroupCallState) so the caller does
-              // not appear as "in call" after a rejected attempt.
-              logger.info(`handleGroupStartMessage: all members busy for group ${msg.toId}` +
-                          ` — sending BusyEvent to ${msg.fromId}`);
-              this.sendBusyEventText(msg, "Busy");
-              States.cancelGroupStart(msg.fromId, msg.toId);
-              States.releaseFloorOfGroup(msg.toId, msg.fromId, () => {
-                States.clearGroupFloorRecipients(msg.toId);
-                States.removeCurrentMessageOfGroup(msg.toId);
-              });
-            }
+            // Commit the recipients list and broadcast START to available members.
+            States.setGroupFloorRecipients(msg.toId, msg.fromId, availableRecipients.map((r) => r + ""));
+            this.server.sendMessageToGroupSubset(msg, availableRecipients);
 
-            // Process a buffered STOP only AFTER the START has been dispatched so that
-            // clients always receive START before STOP (preserves quick tap-and-release).
+            // Process a buffered STOP so quick tap-and-release always sends START then STOP.
             const bufferedStop = this.pendingGroupStop.get(startStopKey);
             if (bufferedStop) {
               this.pendingGroupStop.delete(startStopKey);
@@ -957,9 +987,58 @@ export default class Client extends EventEmitter {
           } else {
             proceed();
           }
+
+          // Safety: clear floor recipients if proceed never runs (defensive).
+          // void floorRecipientEpoch; // Removed to fix lint error
         });
       });
     });
+  }
+
+  private withOperationDedupe(
+    this: Client,
+    operationId: string | null,
+    msg: IMessage,
+    actionType: "START" | "STOP",
+    action: () => void
+  ): void {
+    if (!operationId) {
+      action();
+      return;
+    }
+    const scopedOperationId = `${this.id}:${actionType}:${msg.channelType}:${msg.toId}:${operationId}`;
+    Redis.reserveOperation(scopedOperationId, undefined, (err, reserved) => {
+      if (err) {
+        logger.error(`withOperationDedupe reserveOperation error opId ${scopedOperationId} err ${err}`);
+        action();
+        return;
+      }
+      if (!reserved) {
+        logger.info(`withOperationDedupe duplicate operation ignored opId ${scopedOperationId}`);
+        return;
+      }
+      action();
+    });
+  }
+
+  private extractOperationId(this: Client, msg: IMessage): string | null {
+    if (msg.messageId && typeof msg.messageId === "string") {
+      try {
+        const meta = JSON.parse(msg.messageId);
+        if (meta && typeof meta.operationId === "string" && meta.operationId.length > 0) {
+          return meta.operationId;
+        }
+      } catch (e) { /* no-op */ }
+    }
+    if (msg.payload && typeof msg.payload === "string") {
+      try {
+        const payload = JSON.parse(msg.payload);
+        if (payload && typeof payload.operationId === "string" && payload.operationId.length > 0) {
+          return payload.operationId;
+        }
+      } catch (e) { /* no-op */ }
+    }
+    return null;
   }
 
   private acknowledgeGroupStartMessage(this: Client, msg: IMessage, callback:
@@ -998,13 +1077,13 @@ export default class Client extends EventEmitter {
         messageType = MessageType.START_ACK;
       }
 
-      this.message({
+      this.server.sendMessageToUser({
         channelType: msg.channelType,
         fromId: msg.fromId,
         messageType,
         payload,
         toId: msg.toId
-      });
+      }, msg.fromId);
 
       callback(null, !busy);
     }, (err) => {
