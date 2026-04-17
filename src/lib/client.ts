@@ -63,6 +63,19 @@ export default class Client extends EventEmitter {
     connection.addListener("pong", this.handleConnectionPong);
     this.connections[key] = connection;
 
+    // Clear user state on new connection to prevent stale busy/floor ownership states
+    // This treats reconnection as a fresh session, fixing the issue where users get
+    // stuck in "busy" state after disconnect/reconnect cycles.
+    States.removeActiveParticipantFromAllGroups(this.id);
+    States.releaseFloorOwnershipForUser(this.id);
+    States.releasePrivateFloorOwnershipForUser(this.id);
+    States.clearUserActiveCall(this.id);
+    States.getCallDetailsForUser(this.id, (err2, details) => {
+      if (!err2 && details.inCall && details.channelType === 1) {
+        States.clearUserPrivateCall(details.targetId);
+      }
+    });
+
     this.isLoginDuplicated(deviceId, key, (err, data) => {
       // Guard against race condition: if two sockets connect simultaneously, the first
       // callback to complete will close the other via closeConnectionsExceptKey. When
