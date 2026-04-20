@@ -530,14 +530,25 @@ export default class Client extends EventEmitter {
     }
   }
 
+  /** Parses the START message payload when the caller sends JSON metadata. */
+  private parseStartPayload(this: Client, msg: IMessage): any | null {
+    try {
+      return JSON.parse(msg.payload.toString());
+    } catch {
+      return null;
+    }
+  }
+
   /** Parses the isSosCall flag from the START message payload. */
   private parseIsSosCall(this: Client, msg: IMessage): boolean {
-    try {
-      const data = JSON.parse(msg.payload.toString());
-      return data.isSosCall === true || data.onlyConnectCallOnLongPress === true;
-    } catch {
-      return false;
-    }
+    const data = this.parseStartPayload(msg);
+    return !!data && (data.isSosCall === true || data.onlyConnectCallOnLongPress === true);
+  }
+
+  /** Parses the isInterrupt flag from the START message payload. */
+  private parseIsInterruptCall(this: Client, msg: IMessage): boolean {
+    const data = this.parseStartPayload(msg);
+    return !!data && data.isInterrupt === true;
   }
 
   private acknowledgePrivateStartMessage(this: Client, msg: IMessage) {
@@ -603,7 +614,7 @@ export default class Client extends EventEmitter {
     });
   }
 
-  private finishStopMessage(this: Client, msg: IMessage) {
+  private finishStopMessage(this: Client, msg: IMessage, callback?: () => void) {
     logger.info(`finishStopMessage id ${msg.fromId} to ${msg.toId} messageType ${msg.messageType}`);
 
     Recorder.stop(msg, (err, messageId, duration) => {
@@ -627,6 +638,7 @@ export default class Client extends EventEmitter {
           States.releaseFloorOfGroup(msg.toId, msg.fromId, () => {
             States.clearGroupFloorRecipients(msg.toId, msg.fromId);
             States.removeCurrentMessageOfGroup(msg.toId);
+            if (callback) { callback(); }
           });
         } else {
           // Private channel: release the floor so the other user can speak next.
@@ -638,6 +650,7 @@ export default class Client extends EventEmitter {
           // State is cleared properly when: (a) EndCall text is received, or
           // (b) either user disconnects (handleConnectionClose sends EndCall to peer).
           States.releasePrivateFloor(msg.fromId, msg.toId, msg.fromId);
+          if (callback) { callback(); }
         }
         debug(`id ${this.id} Done removing current message from states`);
         States.getBusyStateOfGroup(msg.toId, (err1, busy) => {
@@ -932,6 +945,22 @@ export default class Client extends EventEmitter {
     this.withOperationDedupe(operationId, msg, "START", () => this.handleGroupStartMessageCore(msg));
   }
 
+  private forceStopCurrentGroupFloorOwner(
+    this: Client,
+    groupId: numberOrString,
+    floorOwnerId: numberOrString,
+    callback: () => void
+  ) {
+    logger.info(`forceStopCurrentGroupFloorOwner: stopping owner ${floorOwnerId} in group ${groupId}`);
+    this.finishStopMessage({
+      channelType: ChannelType.GROUP,
+      fromId: floorOwnerId,
+      messageType: MessageType.STOP,
+      payload: "Interrupted",
+      toId: groupId
+    }, callback);
+  }
+
   private handleGroupStartMessageCore(this: Client, msg: IMessage) {
     // Register the in-flight START so a quick-release STOP can be buffered.
     const startStopKey = `${msg.fromId}_${msg.toId}`;
@@ -954,6 +983,7 @@ export default class Client extends EventEmitter {
       }
     }, 15000);
     const isSos = this.parseIsSosCall(msg);
+    const isInterrupt = this.parseIsInterruptCall(msg);
     const senderIdStr = msg.fromId.toString();
 
     // ── Step 1: Check sender membership + member availability BEFORE acquiring the floor.
@@ -1026,54 +1056,80 @@ export default class Client extends EventEmitter {
           return;
         }
 
-        // ── Step 3: At least one member is available — acquire the floor and proceed.
-        this.acknowledgeGroupStartMessage(msg, (err, acknowledged) => {
-          this.pendingGroupStart.delete(startStopKey);
+        const acquireFloorAndProceed = () => {
+          // ── Step 3: At least one member is available — acquire the floor and proceed.
+          this.acknowledgeGroupStartMessage(msg, (err, acknowledged) => {
+            this.pendingGroupStart.delete(startStopKey);
 
-          if (err) { debug(`id: ${this.id} acknowledgeGroupMessage: groupId: ${msg.toId}` +
-                           ` id: ${msg.fromId} err: ${err}`); }
-          if (!acknowledged) {
-            // Floor was busy (race with another caller) — discard any buffered STOP.
-            this.pendingGroupStop.delete(startStopKey);
+            if (err) { debug(`id: ${this.id} acknowledgeGroupMessage: groupId: ${msg.toId}` +
+                             ` id: ${msg.fromId} err: ${err}`); }
+            if (!acknowledged) {
+              // Floor was busy (race with another caller) — discard any buffered STOP.
+              this.pendingGroupStop.delete(startStopKey);
+              return;
+            }
+
+            States.setGroupSos(msg.toId, isSos);
+            States.setUserGroupCallState(msg.fromId, msg.toId, isSos);
+            States.addUserToActiveCallGroup(msg.fromId, msg.toId, isSos);
+
+            Recorder.start(msg);
+
+            // Block AUDIO until recipient list is committed (avoids early audio leaks).
+            const floorRecipientEpoch = States.setGroupFloorRecipients(msg.toId, msg.fromId, []);
+
+            const proceed = () => {
+              // Commit the recipients list and broadcast START to available members.
+              States.setGroupFloorRecipients(msg.toId, msg.fromId, availableRecipients.map((r) => r + ""));
+              this.server.sendMessageToGroupSubset(msg, availableRecipients);
+
+              // Process a buffered STOP so quick tap-and-release always sends START then STOP.
+              const bufferedStop = this.pendingGroupStop.get(startStopKey);
+              if (bufferedStop) {
+                this.pendingGroupStop.delete(startStopKey);
+                logger.info(`handleGroupStartMessage: processing buffered STOP for` +
+                            ` user ${msg.fromId} group ${msg.toId} (quick tap-and-release)`);
+                this.finishStopMessage(bufferedStop);
+              }
+            };
+
+            if (overrides.length > 0) {
+              Q.all(overrides.map((o) => {
+                const d = Q.defer();
+                o(() => d.resolve(null));
+                return d.promise;
+              })).then(proceed);
+            } else {
+              proceed();
+            }
+
+            // Safety: clear floor recipients if proceed never runs (defensive).
+            // void floorRecipientEpoch; // Removed to fix lint error
+          });
+        };
+
+        if (!isInterrupt) {
+          acquireFloorAndProceed();
+          return;
+        }
+
+        States.getBusyStateOfGroup(msg.toId, (ownerErr, floorOwnerId) => {
+          if (ownerErr) {
+            logger.info(`handleGroupStartMessage: failed to inspect floor owner for interrupt` +
+                        ` group ${msg.toId} err ${ownerErr}`);
+            acquireFloorAndProceed();
             return;
           }
 
-          States.setGroupSos(msg.toId, isSos);
-          States.setUserGroupCallState(msg.fromId, msg.toId, isSos);
-          States.addUserToActiveCallGroup(msg.fromId, msg.toId, isSos);
-
-          Recorder.start(msg);
-
-          // Block AUDIO until recipient list is committed (avoids early audio leaks).
-          const floorRecipientEpoch = States.setGroupFloorRecipients(msg.toId, msg.fromId, []);
-
-          const proceed = () => {
-            // Commit the recipients list and broadcast START to available members.
-            States.setGroupFloorRecipients(msg.toId, msg.fromId, availableRecipients.map((r) => r + ""));
-            this.server.sendMessageToGroupSubset(msg, availableRecipients);
-
-            // Process a buffered STOP so quick tap-and-release always sends START then STOP.
-            const bufferedStop = this.pendingGroupStop.get(startStopKey);
-            if (bufferedStop) {
-              this.pendingGroupStop.delete(startStopKey);
-              logger.info(`handleGroupStartMessage: processing buffered STOP for` +
-                          ` user ${msg.fromId} group ${msg.toId} (quick tap-and-release)`);
-              this.finishStopMessage(bufferedStop);
-            }
-          };
-
-          if (overrides.length > 0) {
-            Q.all(overrides.map((o) => {
-              const d = Q.defer();
-              o(() => d.resolve(null));
-              return d.promise;
-            })).then(proceed);
-          } else {
-            proceed();
+          const floorOwnerIdStr = floorOwnerId ? floorOwnerId.toString() : "0";
+          if (floorOwnerIdStr === "0" || floorOwnerIdStr === senderIdStr) {
+            acquireFloorAndProceed();
+            return;
           }
 
-          // Safety: clear floor recipients if proceed never runs (defensive).
-          // void floorRecipientEpoch; // Removed to fix lint error
+          logger.info(`handleGroupStartMessage: interrupt START from ${msg.fromId}` +
+                      ` preempting floor owner ${floorOwnerIdStr} in group ${msg.toId}`);
+          this.forceStopCurrentGroupFloorOwner(msg.toId, floorOwnerIdStr, acquireFloorAndProceed);
         });
       });
     });
