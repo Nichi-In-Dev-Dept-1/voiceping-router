@@ -288,6 +288,7 @@ export default class Client extends EventEmitter {
     }
 
     const newCallIsSos = this.parseIsSosCall(msg);
+    const newCallIsInterrupt = this.parseIsInterruptCall(msg);
 
     // 1. Check if the SENDER is already in a different active call.
     States.getCallDetailsForUser(msg.fromId, (err1, senderDetails) => {
@@ -337,7 +338,7 @@ export default class Client extends EventEmitter {
           // If the target is busy WITH THE SENDER, allow the call (same session heartbeat).
           if (targetDetails.targetId.toString() === msg.fromId.toString()) {
             logger.info(`handlePrivateStartMessage: continuing existing session between ${msg.fromId} and ${msg.toId}`);
-            this.proceedWithPrivateStart(msg, newCallIsSos);
+            this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt);
             return;
           }
 
@@ -351,7 +352,7 @@ export default class Client extends EventEmitter {
                         ` target ${msg.toId} (was linked to disconnected peer ${targetDetails.targetId})`);
             States.clearUserPrivateCall(msg.toId);
             States.clearUserPrivateCall(targetDetails.targetId);
-            this.proceedWithPrivateStart(msg, newCallIsSos);
+            this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt);
             return;
           }
 
@@ -373,22 +374,37 @@ export default class Client extends EventEmitter {
           // SOS overrides a normal call: end the target's existing call first.
           logger.info(`handlePrivateStartMessage: SOS override — ending existing call for ${msg.toId}`);
           this.executeCallOverrideForUser(msg.toId, targetDetails, () => {
-            this.proceedWithPrivateStart(msg, newCallIsSos);
+            this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt);
           });
           return;
         }
 
-        this.proceedWithPrivateStart(msg, newCallIsSos);
+        this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt);
       });
     });
   }
 
-  private proceedWithPrivateStart(this: Client, msg: IMessage, isSos: boolean) {
+  private proceedWithPrivateStart(
+    this: Client,
+    msg: IMessage,
+    isSos: boolean,
+    isInterrupt: boolean = false,
+    allowInterruptRetry: boolean = true
+  ) {
     // Acquire the private-channel floor before allowing the call to proceed.
     // This is synchronous so it is atomic within a single server process:
     // if both users press simultaneously, only the first START wins.
     States.acquirePrivateFloor(msg.fromId, msg.toId, msg.fromId, (err, acquired, currentOwner) => {
       if (!acquired) {
+        const currentOwnerStr = (currentOwner || "").toString();
+        if (isInterrupt && allowInterruptRetry && currentOwnerStr && currentOwnerStr !== msg.fromId.toString()) {
+          logger.info(`handlePrivateStartMessage: interrupt START from ${msg.fromId}` +
+                      ` preempting private floor owner ${currentOwnerStr} for ${msg.fromId}↔${msg.toId}`);
+          this.forceStopCurrentPrivateFloorOwner(msg.fromId, msg.toId, currentOwnerStr, () => {
+            this.proceedWithPrivateStart(msg, isSos, false, false);
+          });
+          return;
+        }
         logger.info(`handlePrivateStartMessage: floor busy for ${msg.fromId}→${msg.toId},` +
                     ` owner: ${currentOwner} — sending START_FAILED`);
         this.message({
@@ -958,6 +974,26 @@ export default class Client extends EventEmitter {
       messageType: MessageType.STOP,
       payload: "Interrupted",
       toId: groupId
+    }, callback);
+  }
+
+  private forceStopCurrentPrivateFloorOwner(
+    this: Client,
+    userId1: numberOrString,
+    userId2: numberOrString,
+    floorOwnerId: numberOrString,
+    callback: () => void
+  ) {
+    const otherParticipantId =
+      floorOwnerId.toString() === userId1.toString() ? userId2 : userId1;
+    logger.info(`forceStopCurrentPrivateFloorOwner: stopping owner ${floorOwnerId}` +
+                ` for private session ${userId1}↔${userId2}`);
+    this.finishStopMessage({
+      channelType: ChannelType.PRIVATE,
+      fromId: floorOwnerId,
+      messageType: MessageType.STOP,
+      payload: "Interrupted",
+      toId: otherParticipantId
     }, callback);
   }
 
