@@ -263,6 +263,8 @@ export default class States {
     groupId = groupId + "";
     delete groupsDroppedParticipantsSet[groupId];
     delete groupSosState[groupId];
+    // Update in-memory state synchronously so any in-flight overlap checks see
+    // consistent data immediately, before Redis persistence completes.
     Object.keys(activeCallGroupsOfUsersSet).forEach((userId) => {
       activeCallGroupsOfUsersSet[userId] = (activeCallGroupsOfUsersSet[userId] || [])
         .map((id) => id + "")
@@ -270,8 +272,11 @@ export default class States {
       if (userGroupCallState[userId] && userGroupCallState[userId].groupId === groupId + "") {
         delete userGroupCallState[userId];
       }
+    });
+    // Fire Redis cleanup after in-memory is consistent (fire-and-forget per user is fine;
+    // clearActiveParticipantsOfGroup callback is the authoritative completion signal).
+    Object.keys(activeCallGroupsOfUsersSet).forEach((userId) => {
       Redis.removeActiveGroupForUser(userId, groupId);
-      // Clear the u.X.ac Redis key so stale "inCall" state doesn't block future calls.
       if (activeCallGroupsOfUsersSet[userId].length === 0) {
         Redis.clearActiveCall(userId);
       }
@@ -396,6 +401,15 @@ export default class States {
   public static clearUserPrivateCall(userId: numberOrString) {
     delete userPrivateCallState[userId + ""];
     Redis.clearActiveCall(userId);
+  }
+
+  /**
+   * Returns the peerId the user is currently in a private call with, or null if not in one.
+   * Reads in-memory only — synchronous, no async. Used to capture peer before clearing state.
+   */
+  public static getPrivateCallPeer(userId: numberOrString): string | null {
+    const state = userPrivateCallState[userId + ""];
+    return state ? state.peerId : null;
   }
 
   /**

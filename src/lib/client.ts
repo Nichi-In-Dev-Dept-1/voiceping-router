@@ -63,18 +63,19 @@ export default class Client extends EventEmitter {
     connection.addListener("pong", this.handleConnectionPong);
     this.connections[key] = connection;
 
-    // Clear user state on new connection to prevent stale busy/floor ownership states
-    // This treats reconnection as a fresh session, fixing the issue where users get
-    // stuck in "busy" state after disconnect/reconnect cycles.
+    // Clear user state on new connection to prevent stale busy/floor ownership states.
+    // IMPORTANT: capture the private-call peer BEFORE wiping in-memory state so we can
+    // also clear the peer's side.  Reading peer AFTER clearUserActiveCall would find
+    // userPrivateCallState[id] already deleted and never reach the peer cleanup.
+    const stalePeer = States.getPrivateCallPeer(this.id);
     States.removeActiveParticipantFromAllGroups(this.id);
     States.releaseFloorOwnershipForUser(this.id);
     States.releasePrivateFloorOwnershipForUser(this.id);
     States.clearUserActiveCall(this.id);
-    States.getCallDetailsForUser(this.id, (err2, details) => {
-      if (!err2 && details.inCall && details.channelType === 1) {
-        States.clearUserPrivateCall(details.targetId);
-      }
-    });
+    if (stalePeer) {
+      logger.info(`registerSocket: clearing stale private call peer ${stalePeer} for reconnecting user ${this.id}`);
+      States.clearUserPrivateCall(stalePeer);
+    }
 
     this.isLoginDuplicated(deviceId, key, (err, data) => {
       // Guard against race condition: if two sockets connect simultaneously, the first
@@ -276,6 +277,16 @@ export default class Client extends EventEmitter {
   private handlePrivateStartMessageCore(this: Client, msg: IMessage) {
     debug(`id ${this.id} handlePrivateStartMessage ${JSON.stringify(msg)}`);
 
+    // Reject START messages to invalid/system targets. "00000", "0", and empty
+    // are SDK heartbeat/echo addresses — allowing them sets stale call state that
+    // blocks all future real calls for both the sender and the fake target.
+    const toIdStr = (msg.toId || "").toString().replace(/^0+$/, "0");
+    if (!msg.toId || toIdStr === "0" || toIdStr === "00000") {
+      logger.info(`handlePrivateStartMessage: rejecting START from ${msg.fromId}` +
+                  ` to invalid target "${msg.toId}" — ignoring`);
+      return;
+    }
+
     const newCallIsSos = this.parseIsSosCall(msg);
 
     // 1. Check if the SENDER is already in a different active call.
@@ -294,6 +305,7 @@ export default class Client extends EventEmitter {
             logger.info(`handlePrivateStartMessage: clearing stale private call state for` +
                         ` ${msg.fromId} (was linked to disconnected peer ${senderDetails.targetId})`);
             States.clearUserPrivateCall(msg.fromId);
+            States.clearUserPrivateCall(senderDetails.targetId);
           } else {
             logger.info(`handlePrivateStartMessage: sender ${msg.fromId} is busy with` +
                         ` ${senderDetails.targetId} — rejecting call to ${msg.toId}`);
@@ -323,6 +335,18 @@ export default class Client extends EventEmitter {
           // If the target is busy WITH THE SENDER, allow the call (same session heartbeat).
           if (targetDetails.targetId.toString() === msg.fromId.toString()) {
             logger.info(`handlePrivateStartMessage: continuing existing session between ${msg.fromId} and ${msg.toId}`);
+            this.proceedWithPrivateStart(msg, newCallIsSos);
+            return;
+          }
+
+          // Before rejecting, check whether the peer the TARGET is "in a call with"
+          // is actually still connected. If not, the state is stale (previous call ended
+          // without a clean EndCall) — clear it and let this fresh call through.
+          if (!this.server.isUserConnected(targetDetails.targetId)) {
+            logger.info(`handlePrivateStartMessage: clearing stale private call state for` +
+                        ` target ${msg.toId} (was linked to disconnected peer ${targetDetails.targetId})`);
+            States.clearUserPrivateCall(msg.toId);
+            States.clearUserPrivateCall(targetDetails.targetId);
             this.proceedWithPrivateStart(msg, newCallIsSos);
             return;
           }
@@ -852,6 +876,8 @@ export default class Client extends EventEmitter {
 
   private handleGroupAudioMessage(this: Client, msg: IMessage) {
     logger.info(`handleGroupAudioMessage id ${msg.fromId} to ${msg.toId} messageType ${msg.messageType}`);
+    // Snapshot recipients at owner-check time so we detect floor transfers that happen
+    // during the async Recorder.resume I/O before routing the packet.
     States.isFloorOwnerOfGroup(msg.toId, msg.fromId, (ownerErr, isOwner) => {
       if (ownerErr) {
         debug(`id: ${this.id} handleGroupAudioMessage owner check err: ${ownerErr}`);
@@ -861,16 +887,29 @@ export default class Client extends EventEmitter {
         debug(`id: ${this.id} dropping group AUDIO from non-owner ${msg.fromId} for group ${msg.toId}`);
         return;
       }
+      // Capture the recipient list at the time ownership is confirmed.
+      // If the floor transfers while Recorder.resume is in-flight, getGroupFloorRecipients
+      // will return undefined for the old owner, which we use to drop the stale packet.
+      const recipientsSnapshot = States.getGroupFloorRecipients(msg.toId, msg.fromId);
       States.refreshFloorOfGroup(msg.toId, msg.fromId);
       Recorder.resume(msg, (err, messageId, duration) => {
         if (err) { debug(`id: ${this.id} recorder.resume: err: ${err} messageId: ${messageId}` +
                          ` duration: ${duration}`); }
 
+        // Re-check ownership after async I/O to guard against mid-callback floor transfer.
+        const recipientsNow = States.getGroupFloorRecipients(msg.toId, msg.fromId);
+        // If the snapshot had recipients but now the owner has changed (undefined returned
+        // for old owner), drop this stale audio packet.
+        if (recipientsSnapshot !== undefined && recipientsNow === undefined) {
+          debug(`id: ${this.id} dropping AUDIO from ${msg.fromId} — floor transferred during I/O`);
+          return;
+        }
+
         // Use the floor-session recipient list when available (overlap-aware subset delivery).
         // undefined → normal call, broadcast to everyone in the group.
         // [] (empty) → all members were busy; drop this audio packet.
         // [...ids]  → partial availability; deliver only to the members who received START.
-        const recipients = States.getGroupFloorRecipients(msg.toId, msg.fromId);
+        const recipients = recipientsNow;
         if (recipients !== undefined) {
           if (recipients.length === 0) {
             debug(`id: ${this.id} dropping AUDIO from ${msg.fromId} — group ${msg.toId} recipients empty (all-busy)`);
@@ -892,7 +931,24 @@ export default class Client extends EventEmitter {
   private handleGroupStartMessageCore(this: Client, msg: IMessage) {
     // Register the in-flight START so a quick-release STOP can be buffered.
     const startStopKey = `${msg.fromId}_${msg.toId}`;
+    // If a previous START for this key never cleaned up (e.g. floor acquisition hung),
+    // discard the stale buffered STOP so it cannot be replayed into this new session.
+    if (this.pendingGroupStart.has(startStopKey)) {
+      logger.info(`handleGroupStartMessage: new START arrived while previous still in-flight` +
+                  ` for user ${msg.fromId} group ${msg.toId} — clearing stale STOP buffer`);
+      this.pendingGroupStop.delete(startStopKey);
+    }
     this.pendingGroupStart.set(startStopKey, msg);
+    // Safety: if floor acquisition hangs beyond 15 s, clear both maps to prevent
+    // a buffered STOP from a dead session being replayed into a future one.
+    setTimeout(() => {
+      if (this.pendingGroupStart.has(startStopKey)) {
+        logger.info(`handleGroupStartMessage: TTL expiry — clearing stale pending START` +
+                    ` for user ${msg.fromId} group ${msg.toId}`);
+        this.pendingGroupStart.delete(startStopKey);
+        this.pendingGroupStop.delete(startStopKey);
+      }
+    }, 15000);
     const isSos = this.parseIsSosCall(msg);
     const senderIdStr = msg.fromId.toString();
 
@@ -938,9 +994,20 @@ export default class Client extends EventEmitter {
             availableRecipients.push(uid);
             overrides.push((done) => this.executeCallOverrideForUser(uid, details, done));
           } else {
-            logger.info(`handleGroupStartMessage: skipping busy member ${uid}` +
-                        ` (sos=${details.isSos} newSos=${isSos}` +
-                        ` theirChannel=${details.channelType} theirTarget=${details.targetId})`);
+            // If the member's "busy" state is against the SDK heartbeat target (00000 or all
+            // zeros), that is stale state from a connection heartbeat — clear it and include them.
+            const targetIdStr = (details.targetId || "").toString().replace(/^0+$/, "0");
+            if (targetIdStr === "0" || targetIdStr === "00000") {
+              logger.info(`handleGroupStartMessage: member ${uid} has stale 00000 private call` +
+                          ` state — clearing and including in group call`);
+              States.clearUserPrivateCall(uid);
+              States.clearUserPrivateCall(details.targetId);
+              availableRecipients.push(uid);
+            } else {
+              logger.info(`handleGroupStartMessage: skipping busy member ${uid}` +
+                          ` (sos=${details.isSos} newSos=${isSos}` +
+                          ` theirChannel=${details.channelType} theirTarget=${details.targetId})`);
+            }
           }
         });
 
