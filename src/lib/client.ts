@@ -301,7 +301,9 @@ export default class Client extends EventEmitter {
           // Before rejecting, check whether the peer the sender is "in a call with"
           // is actually still connected.  If not, the state is stale (previous call
           // ended without a clean EndCall) — clear it and let this call through.
-          if (!this.server.isUserConnected(senderDetails.targetId)) {
+          // Skip this check for GROUP calls: group IDs are not WebSocket clients so
+          // isUserConnected always returns false, which would wrongly clear active group call state.
+          if (senderDetails.channelType !== 2 && !this.server.isUserConnected(senderDetails.targetId)) {
             logger.info(`handlePrivateStartMessage: clearing stale private call state for` +
                         ` ${msg.fromId} (was linked to disconnected peer ${senderDetails.targetId})`);
             States.clearUserPrivateCall(msg.fromId);
@@ -342,7 +344,9 @@ export default class Client extends EventEmitter {
           // Before rejecting, check whether the peer the TARGET is "in a call with"
           // is actually still connected. If not, the state is stale (previous call ended
           // without a clean EndCall) — clear it and let this fresh call through.
-          if (!this.server.isUserConnected(targetDetails.targetId)) {
+          // Skip this check for GROUP calls: group IDs are not WebSocket clients so
+          // isUserConnected always returns false, which would wrongly clear active group call state.
+          if (targetDetails.channelType !== 2 && !this.server.isUserConnected(targetDetails.targetId)) {
             logger.info(`handlePrivateStartMessage: clearing stale private call state for` +
                         ` target ${msg.toId} (was linked to disconnected peer ${targetDetails.targetId})`);
             States.clearUserPrivateCall(msg.toId);
