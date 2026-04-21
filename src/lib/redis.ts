@@ -707,6 +707,57 @@ class Redis {
 
   // ---------------------------------------------------------------------------
 
+  /**
+   * Deletes all transient runtime keys (floor locks, active-call state) from Redis.
+   * Called once on server startup so stale entries from a previous process/container
+   * don't corrupt in-memory state that has been reset to zero.
+   * Permanent data (user info, group membership, messages) is NOT touched.
+   */
+  public static clearRuntimeState(callback?: (err: Error) => void): void {
+    // Patterns covering all volatile call-session keys:
+    //   pf.*  → private floor locks
+    //   gf.*  → group floor locks
+    //   u.*.ac → per-user active-call hash
+    //   u.*.ag → per-user active-groups set
+    //   g.*.ap → per-group active-participants set
+    const patterns = ["pf.*", "gf.*", "u.*.ac", "u.*.ag", "g.*.ap"];
+    let pending = patterns.length;
+    let firstErr: Error = null;
+
+    function scanAndDelete(pattern: string, cursor: string, done: (err: Error) => void) {
+      (client as any).scan(cursor, "MATCH", pattern, "COUNT", "200", function(err: Error, reply: any) {
+        if (err) { return done(err); }
+        const nextCursor: string = reply[0];
+        const keys: string[] = reply[1];
+        if (keys && keys.length > 0) {
+          client.del.apply(client, [...keys, function(delErr: Error) {
+            if (delErr) { return done(delErr); }
+            if (nextCursor === "0") { return done(null); }
+            scanAndDelete(pattern, nextCursor, done);
+          }]);
+        } else {
+          if (nextCursor === "0") { return done(null); }
+          scanAndDelete(pattern, nextCursor, done);
+        }
+      });
+    }
+
+    patterns.forEach(function(pattern) {
+      scanAndDelete(pattern, "0", function(err) {
+        if (err && !firstErr) { firstErr = err; }
+        pending--;
+        if (pending === 0) {
+          if (firstErr) {
+            logger.error("Redis.clearRuntimeState error:", firstErr);
+          } else {
+            logger.info("Redis.clearRuntimeState: stale call state cleared");
+          }
+          if (callback) { callback(firstErr); }
+        }
+      });
+    });
+  }
+
   public static periodicClean() {
     if (cleanInterval) { return; }
     cleanInterval = setInterval(function() {

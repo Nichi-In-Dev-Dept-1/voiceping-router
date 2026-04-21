@@ -61,6 +61,7 @@ class Server implements IServer {
     States.setMemored(opts.memo);
     States.periodicInspect();
     if (WORKER_NUMBER.toString() === "1") {
+        Redis.clearRuntimeState();
         Redis.periodicClean();
     }
 
