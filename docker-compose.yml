@@ -3,7 +3,7 @@ version: '3.1'
 services:
 
   vp-router:
-    image: "smartwalkie/voiceping-router"
+    build: .
     environment:
       - REDIS_HOST=redis
     ports:
