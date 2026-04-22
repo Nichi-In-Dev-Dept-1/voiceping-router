@@ -92,6 +92,21 @@ export default class States {
     }
   }
 
+  // Synchronously seeds in-memory group membership from data already known at
+  // login (JWT channelIds). Prevents the race where a PTT START arrives before
+  // the async Redis.addUserToGroup callback has populated the in-memory state.
+  public static addUserToGroupImmediate(userId: numberOrString, groupId: numberOrString) {
+    const uid = userId + "";
+    const gid = groupId + "";
+    const userIds: string[] = ((usersInsideGroupsSet[gid] || []) as any[]).map((u) => u + "");
+    if (!userIds.includes(uid)) { userIds.push(uid); }
+    usersInsideGroupsSet[gid] = userIds;
+
+    const groupIds: string[] = ((groupsOfUsersSet[uid] || []) as any[]).map((g) => g + "");
+    if (!groupIds.includes(gid)) { groupIds.push(gid); }
+    groupsOfUsersSet[uid] = groupIds;
+  }
+
   public static addUserToGroup(
     userId: numberOrString,
     groupId: numberOrString,

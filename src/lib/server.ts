@@ -275,6 +275,11 @@ class Server implements IServer {
     this.sockets[id] = socket;
 
     if (user && user.channelIds instanceof Array) {
+      // Seed in-memory membership immediately (synchronous) so that PTT START
+      // messages arriving before the async Redis callbacks complete still pass
+      // the sender membership check — fixes first-login call failure.
+      user.channelIds.forEach((groupId) => { States.addUserToGroupImmediate(id, groupId); });
+
       user.channelIds.forEach((groupId) => {
         Redis.addUserToGroup(id, groupId, (err) => {
           if (err) {
