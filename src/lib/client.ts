@@ -311,7 +311,8 @@ export default class Client extends EventEmitter {
           if (targetDetails.inCall) {
             // Busy WITH THE SENDER — allow (same-session heartbeat).
             if (targetDetails.targetId.toString() === msg.fromId.toString()) {
-              logger.info(`handlePrivateStartMessage: continuing existing session between ${msg.fromId} and ${msg.toId}`);
+              logger.info(`handlePrivateStartMessage: continuing existing session` +
+                          ` between ${msg.fromId} and ${msg.toId}`);
               this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt);
               return;
             }
@@ -342,7 +343,10 @@ export default class Client extends EventEmitter {
                 if (!newCallIsSos || targetDetails.isSos) {
                   logger.info(`handlePrivateStartMessage: target ${msg.toId} busy` +
                               ` (existingSos=${targetDetails.isSos} newSos=${newCallIsSos}) — rejecting ${msg.fromId}`);
-                  this.message({ channelType: msg.channelType, fromId: msg.fromId, messageType: MessageType.START_FAILED, payload: "Busy", toId: msg.toId });
+                  this.message({
+                    channelType: msg.channelType, fromId: msg.fromId,
+                    messageType: MessageType.START_FAILED, payload: "Busy", toId: msg.toId
+                  });
                   this.sendBusyEventText(msg, "Busy");
                   return;
                 }
@@ -406,7 +410,10 @@ export default class Client extends EventEmitter {
               }
               logger.info(`handlePrivateStartMessage: sender ${msg.fromId} is busy with` +
                           ` ${senderDetails.targetId} — rejecting call to ${msg.toId}`);
-              this.message({ channelType: msg.channelType, fromId: msg.fromId, messageType: MessageType.START_FAILED, payload: "Busy", toId: msg.toId });
+              this.message({
+                channelType: msg.channelType, fromId: msg.fromId,
+                messageType: MessageType.START_FAILED, payload: "Busy", toId: msg.toId
+              });
               this.sendBusyEventText(msg, "Busy");
             });
           }
@@ -511,9 +518,9 @@ export default class Client extends EventEmitter {
     userId2: numberOrString,
     callback: (held: boolean) => void
   ): void {
-    States.isPrivateFloorOwner(userId1, userId2, userId1, (_, u1Owns) => {
+    States.isPrivateFloorOwner(userId1, userId2, userId1, (e1, u1Owns) => {
       if (u1Owns) { return callback(true); }
-      States.isPrivateFloorOwner(userId1, userId2, userId2, (_, u2Owns) => callback(u2Owns));
+      States.isPrivateFloorOwner(userId1, userId2, userId2, (e2, u2Owns) => callback(u2Owns));
     });
   }
 
