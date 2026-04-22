@@ -296,91 +296,136 @@ export default class Client extends EventEmitter {
         logger.info(`handlePrivateStartMessage: sender ${msg.fromId} lookup error: ${err1}`);
       }
 
+      // 2. Target check — defined as a named closure so both the synchronous and
+      //    asynchronous (floor-ownership) sender-stale paths can reach it without
+      //    duplicating the entire block.
+      const doTargetCheck = () => {
+        States.getCallDetailsForUser(msg.toId, (err2, targetDetails) => {
+          if (err2) {
+            logger.info(`handlePrivateStartMessage: target ${msg.toId} lookup error: ${err2}`);
+          }
+
+          logger.info(`handlePrivateStartMessage check: target=${msg.toId} inCall=${targetDetails.inCall}` +
+                      ` targetBusyWith=${targetDetails.targetId} sender=${msg.fromId}`);
+
+          if (targetDetails.inCall) {
+            // Busy WITH THE SENDER — allow (same-session heartbeat).
+            if (targetDetails.targetId.toString() === msg.fromId.toString()) {
+              logger.info(`handlePrivateStartMessage: continuing existing session between ${msg.fromId} and ${msg.toId}`);
+              this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt);
+              return;
+            }
+
+            // Peer is disconnected — state is definitively stale.
+            if (targetDetails.channelType !== 2 && !this.server.isUserConnected(targetDetails.targetId)) {
+              logger.info(`handlePrivateStartMessage: clearing stale private call state for` +
+                          ` target ${msg.toId} (was linked to disconnected peer ${targetDetails.targetId})`);
+              States.clearUserPrivateCall(msg.toId);
+              States.clearUserPrivateCall(targetDetails.targetId);
+              this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt);
+              return;
+            }
+
+            // Peer appears connected in a private call. Verify the floor is still held —
+            // if the call ended client-side without a STOP the floor expires but in-call
+            // state lingers, blocking all subsequent calls until TTL.
+            if (targetDetails.channelType === 1) {
+              return this.isPrivateCallFloorHeld(msg.toId, targetDetails.targetId, (held) => {
+                if (!held) {
+                  logger.info(`handlePrivateStartMessage: target ${msg.toId} has stale in-call state` +
+                              ` with connected peer ${targetDetails.targetId} (no floor held) — clearing`);
+                  States.clearUserPrivateCall(msg.toId);
+                  States.clearUserPrivateCall(targetDetails.targetId);
+                  this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt);
+                  return;
+                }
+                if (!newCallIsSos || targetDetails.isSos) {
+                  logger.info(`handlePrivateStartMessage: target ${msg.toId} busy` +
+                              ` (existingSos=${targetDetails.isSos} newSos=${newCallIsSos}) — rejecting ${msg.fromId}`);
+                  this.message({ channelType: msg.channelType, fromId: msg.fromId, messageType: MessageType.START_FAILED, payload: "Busy", toId: msg.toId });
+                  this.sendBusyEventText(msg, "Busy");
+                  return;
+                }
+                logger.info(`handlePrivateStartMessage: SOS override — ending existing call for ${msg.toId}`);
+                this.executeCallOverrideForUser(msg.toId, targetDetails, () => {
+                  this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt);
+                });
+              });
+            }
+
+            if (!newCallIsSos || targetDetails.isSos) {
+              // Reject: normal→any or sos→sos
+              logger.info(`handlePrivateStartMessage: target ${msg.toId} busy (existingSos=${targetDetails.isSos}` +
+                          ` newSos=${newCallIsSos}) — rejecting ${msg.fromId}`);
+              this.message({
+                channelType: msg.channelType,
+                fromId: msg.fromId,
+                messageType: MessageType.START_FAILED,
+                payload: "Busy",
+                toId: msg.toId
+              });
+              this.sendBusyEventText(msg, "Busy");
+              return;
+            }
+
+            // SOS overrides a normal call: end the target's existing call first.
+            logger.info(`handlePrivateStartMessage: SOS override — ending existing call for ${msg.toId}`);
+            this.executeCallOverrideForUser(msg.toId, targetDetails, () => {
+              this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt);
+            });
+            return;
+          }
+
+          this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt);
+        });
+      };
+
       if (!err1 && senderDetails.inCall) {
         // If the sender is busy with someone else, they can't start a new call.
         if (senderDetails.targetId.toString() !== msg.toId.toString()) {
-          // Before rejecting, check whether the peer the sender is "in a call with"
-          // is actually still connected.  If not, the state is stale (previous call
-          // ended without a clean EndCall) — clear it and let this call through.
-          // Skip this check for GROUP calls: group IDs are not WebSocket clients so
-          // isUserConnected always returns false, which would wrongly clear active group call state.
+          // Peer is disconnected — state is definitively stale.
           if (senderDetails.channelType !== 2 && !this.server.isUserConnected(senderDetails.targetId)) {
             logger.info(`handlePrivateStartMessage: clearing stale private call state for` +
                         ` ${msg.fromId} (was linked to disconnected peer ${senderDetails.targetId})`);
             States.clearUserPrivateCall(msg.fromId);
             States.clearUserPrivateCall(senderDetails.targetId);
-          } else {
-            logger.info(`handlePrivateStartMessage: sender ${msg.fromId} is busy with` +
-                        ` ${senderDetails.targetId} — rejecting call to ${msg.toId}`);
-            this.message({
-              channelType: msg.channelType,
-              fromId: msg.fromId,
-              messageType: MessageType.START_FAILED,
-              payload: "Busy",
-              toId: msg.toId
-            });
-            this.sendBusyEventText(msg, "Busy");
+            doTargetCheck();
             return;
           }
+          // Peer appears connected in a private call. Verify floor is still held before
+          // rejecting — otherwise a call that ended without a STOP blocks the sender forever.
+          if (senderDetails.channelType === 1) {
+            return this.isPrivateCallFloorHeld(msg.fromId, senderDetails.targetId, (held) => {
+              if (!held) {
+                logger.info(`handlePrivateStartMessage: sender ${msg.fromId} has stale in-call state` +
+                            ` with connected peer ${senderDetails.targetId} (no floor held) — clearing`);
+                States.clearUserPrivateCall(msg.fromId);
+                States.clearUserPrivateCall(senderDetails.targetId);
+                doTargetCheck();
+                return;
+              }
+              logger.info(`handlePrivateStartMessage: sender ${msg.fromId} is busy with` +
+                          ` ${senderDetails.targetId} — rejecting call to ${msg.toId}`);
+              this.message({ channelType: msg.channelType, fromId: msg.fromId, messageType: MessageType.START_FAILED, payload: "Busy", toId: msg.toId });
+              this.sendBusyEventText(msg, "Busy");
+            });
+          }
+          // Group-type busy — reject immediately (floor check not applicable for group floors).
+          logger.info(`handlePrivateStartMessage: sender ${msg.fromId} is busy with` +
+                      ` ${senderDetails.targetId} — rejecting call to ${msg.toId}`);
+          this.message({
+            channelType: msg.channelType,
+            fromId: msg.fromId,
+            messageType: MessageType.START_FAILED,
+            payload: "Busy",
+            toId: msg.toId
+          });
+          this.sendBusyEventText(msg, "Busy");
+          return;
         }
       }
 
-      // 2. Check if the TARGET user is already in an active call.
-      States.getCallDetailsForUser(msg.toId, (err2, targetDetails) => {
-        if (err2) {
-          logger.info(`handlePrivateStartMessage: target ${msg.toId} lookup error: ${err2}`);
-        }
-
-        logger.info(`handlePrivateStartMessage check: target=${msg.toId} inCall=${targetDetails.inCall}` +
-                    ` targetBusyWith=${targetDetails.targetId} sender=${msg.fromId}`);
-
-        if (targetDetails.inCall) {
-          // If the target is busy WITH THE SENDER, allow the call (same session heartbeat).
-          if (targetDetails.targetId.toString() === msg.fromId.toString()) {
-            logger.info(`handlePrivateStartMessage: continuing existing session between ${msg.fromId} and ${msg.toId}`);
-            this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt);
-            return;
-          }
-
-          // Before rejecting, check whether the peer the TARGET is "in a call with"
-          // is actually still connected. If not, the state is stale (previous call ended
-          // without a clean EndCall) — clear it and let this fresh call through.
-          // Skip this check for GROUP calls: group IDs are not WebSocket clients so
-          // isUserConnected always returns false, which would wrongly clear active group call state.
-          if (targetDetails.channelType !== 2 && !this.server.isUserConnected(targetDetails.targetId)) {
-            logger.info(`handlePrivateStartMessage: clearing stale private call state for` +
-                        ` target ${msg.toId} (was linked to disconnected peer ${targetDetails.targetId})`);
-            States.clearUserPrivateCall(msg.toId);
-            States.clearUserPrivateCall(targetDetails.targetId);
-            this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt);
-            return;
-          }
-
-          if (!newCallIsSos || targetDetails.isSos) {
-            // Reject: normal→any or sos→sos
-            logger.info(`handlePrivateStartMessage: target ${msg.toId} busy (existingSos=${targetDetails.isSos}` +
-                        ` newSos=${newCallIsSos}) — rejecting ${msg.fromId}`);
-            this.message({
-              channelType: msg.channelType,
-              fromId: msg.fromId,
-              messageType: MessageType.START_FAILED,
-              payload: "Busy",
-              toId: msg.toId
-            });
-            this.sendBusyEventText(msg, "Busy");
-            return;
-          }
-
-          // SOS overrides a normal call: end the target's existing call first.
-          logger.info(`handlePrivateStartMessage: SOS override — ending existing call for ${msg.toId}`);
-          this.executeCallOverrideForUser(msg.toId, targetDetails, () => {
-            this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt);
-          });
-          return;
-        }
-
-        this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt);
-      });
+      doTargetCheck();
     });
   }
 
@@ -405,6 +450,34 @@ export default class Client extends EventEmitter {
           });
           return;
         }
+        // Cluster-safe orphan check: verify the floor owner is still in a private call
+        // with one of the parties. getCallDetailsForUser checks in-memory then Redis,
+        // so it works correctly across all worker processes.
+        if (currentOwnerStr && currentOwnerStr !== "0") {
+          return States.getCallDetailsForUser(currentOwnerStr, (detailsErr, ownerDetails) => {
+            const fromStr = msg.fromId.toString();
+            const toStr   = msg.toId.toString();
+            const floorIsOrphaned = detailsErr || !ownerDetails.inCall ||
+              ownerDetails.channelType !== 1 ||
+              (ownerDetails.targetId !== fromStr && ownerDetails.targetId !== toStr);
+            if (floorIsOrphaned) {
+              logger.info(`proceedWithPrivateStart: private floor owner ${currentOwnerStr} has no` +
+                          ` matching call state — force-releasing orphaned floor for ${msg.fromId}↔${msg.toId}`);
+              return States.releasePrivateFloor(msg.fromId, msg.toId, currentOwnerStr, () => {
+                this.proceedWithPrivateStart(msg, isSos, isInterrupt, false);
+              });
+            }
+            logger.info(`handlePrivateStartMessage: floor busy for ${msg.fromId}→${msg.toId},` +
+                        ` owner: ${currentOwner} — sending START_FAILED`);
+            this.message({
+              channelType: msg.channelType,
+              fromId: msg.fromId,
+              messageType: MessageType.START_FAILED,
+              payload: "Busy",
+              toId: msg.toId
+            });
+          });
+        }
         logger.info(`handlePrivateStartMessage: floor busy for ${msg.fromId}→${msg.toId},` +
                     ` owner: ${currentOwner} — sending START_FAILED`);
         this.message({
@@ -424,6 +497,23 @@ export default class Client extends EventEmitter {
       this.acknowledgePrivateStartMessage(msg);
       States.setCurrentMessageOfUser(msg.fromId, msg);
       this.emit("message", msg, this);
+    });
+  }
+
+  /**
+   * Returns true if either party currently holds the private floor in Redis.
+   * Used to distinguish a genuinely active private call from stale in-call state
+   * left behind when a call ended without a clean STOP reaching the router.
+   */
+  private isPrivateCallFloorHeld(
+    this: Client,
+    userId1: numberOrString,
+    userId2: numberOrString,
+    callback: (held: boolean) => void
+  ): void {
+    States.isPrivateFloorOwner(userId1, userId2, userId1, (_, u1Owns) => {
+      if (u1Owns) { return callback(true); }
+      States.isPrivateFloorOwner(userId1, userId2, userId2, (_, u2Owns) => callback(u2Owns));
     });
   }
 
@@ -1042,7 +1132,29 @@ export default class Client extends EventEmitter {
         if (uid.toString() === senderIdStr) { return Q.resolve(null); }
         const deferred = Q.defer();
         States.getCallDetailsForUser(uid, (detailsErr, details) => {
-          deferred.resolve({ uid, details });
+          // For a member shown as busy in a DIFFERENT group call, verify that group's floor
+          // is still active. If the floor has no owner (call ended without cleanup — crash or
+          // lost STOP), this member's active-call state is stale and they should be included.
+          if (!detailsErr && details.inCall && details.channelType === 2 &&
+              details.targetId !== msg.toId.toString()) {
+            // Verify the member is still an active participant in the group they claim to be in.
+            // getActiveParticipantsOfGroup has a Redis fallback — correct across all cluster workers.
+            States.getActiveParticipantsOfGroup(details.targetId, (apErr, activeParticipants) => {
+              const memberStillActive = !apErr && (activeParticipants || []).some(
+                (p) => p.toString() === uid.toString()
+              );
+              if (!memberStillActive) {
+                logger.info(`handleGroupStartMessage: member ${uid} has stale group-call state` +
+                            ` for group ${details.targetId} (not in active participants) — clearing and including`);
+                States.removeActiveParticipantFromAllGroups(uid);
+                deferred.resolve({ uid, details: { ...details, inCall: false } });
+              } else {
+                deferred.resolve({ uid, details });
+              }
+            });
+          } else {
+            deferred.resolve({ uid, details });
+          }
         });
         return deferred.promise;
       });
@@ -1235,6 +1347,33 @@ export default class Client extends EventEmitter {
             return resolve(false);
           });
         } else {
+          const ownerStr = (floorOwner || "").toString();
+          if (ownerStr && ownerStr !== "0") {
+            // Cluster-safe orphan check: verify the floor owner is still an active participant
+            // in this group. getActiveParticipantsOfGroup has a Redis fallback so it works
+            // correctly across all worker processes.
+            return States.getActiveParticipantsOfGroup(msg.toId, (apErr, activeParticipants) => {
+              const ownerStillActive = !apErr && (activeParticipants || []).some(
+                (p) => p.toString() === ownerStr
+              );
+              if (!ownerStillActive) {
+                logger.info(`acknowledgeGroupStartMessage: group ${msg.toId} floor owner ${ownerStr}` +
+                            ` is not an active participant — force-releasing orphaned floor and retrying`);
+                return States.releaseFloorOfGroup(msg.toId, ownerStr, () => {
+                  States.acquireFloorOfGroup(msg.toId, msg.fromId, (retryErr, retryAcquired) => {
+                    if (retryErr) { return reject(retryErr); }
+                    if (!retryAcquired) { return resolve(true); }
+                    States.setCurrentMessageOfGroup(msg.toId, msg, (setErr) => {
+                      if (setErr) { return reject(setErr); }
+                      return resolve(false);
+                    });
+                  });
+                });
+              }
+              debug(`id ${this.id} floor busy for group ${msg.toId} owner ${floorOwner}`);
+              return resolve(true);
+            });
+          }
           debug(`id ${this.id} floor busy for group ${msg.toId} owner ${floorOwner}`);
           return resolve(true);
         }
@@ -1263,7 +1402,16 @@ export default class Client extends EventEmitter {
 
       callback(null, !busy);
     }, (err) => {
-      debug(`id ${this.id} acknowledgeGroupStartMessage groupId ${msg.toId} ERR ${err}`);
+      // Redis error during floor acquisition — send an explicit START_FAILED so the client
+      // gets immediate feedback instead of hanging until ACK_START Timeout (code=4).
+      logger.error(`acknowledgeGroupStartMessage: groupId ${msg.toId} from ${msg.fromId} err ${err}`);
+      this.server.sendMessageToUser({
+        channelType: msg.channelType,
+        fromId: msg.fromId,
+        messageType: MessageType.START_FAILED,
+        payload: "Busy",
+        toId: msg.toId
+      }, msg.fromId);
       return callback(null, false);
     });
   }

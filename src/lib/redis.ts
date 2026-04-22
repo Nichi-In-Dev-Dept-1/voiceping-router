@@ -24,7 +24,10 @@ let cleanGroup: number = 1;
 // TTL for active-call Redis entries — auto-expires stale entries after busyTimeout seconds.
 const ACTIVE_STATE_TTL = Math.ceil(config.group.busyTimeout / 1000);
 const SIGNALING_OUTBOX_MAX_ITEMS = 200;
-const SIGNALING_OPERATION_TTL_SEC = 120;
+// 15 s is long enough to prevent duplicate processing of a retried START,
+// but short enough that a failed attempt (Redis error, floor-acquire error)
+// doesn't permanently block the next retry for 2 minutes.
+const SIGNALING_OPERATION_TTL_SEC = 15;
 
 class Redis {
   public static nextSignalingSeq(
