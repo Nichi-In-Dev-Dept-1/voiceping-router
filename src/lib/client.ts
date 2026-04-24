@@ -457,6 +457,16 @@ export default class Client extends EventEmitter {
           });
           return;
         }
+        // Deduplication guard: if the sender already owns the floor (duplicate START race),
+        // the first START already sent START_ACK and relayed to the target. Re-acknowledge
+        // silently instead of sending START_FAILED, which would confuse the app into
+        // tearing down the call it just established.
+        if (currentOwnerStr && currentOwnerStr === msg.fromId.toString()) {
+          logger.info(`proceedWithPrivateStart: ${msg.fromId} already owns private floor` +
+                      ` for ${msg.fromId}↔${msg.toId} — duplicate START, re-acking silently`);
+          this.acknowledgePrivateStartMessage(msg);
+          return;
+        }
         // Cluster-safe orphan check: verify the floor owner is still in a private call
         // with one of the parties. getCallDetailsForUser checks in-memory then Redis,
         // so it works correctly across all worker processes.

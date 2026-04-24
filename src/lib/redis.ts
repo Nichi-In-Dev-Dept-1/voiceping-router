@@ -718,12 +718,17 @@ class Redis {
    */
   public static clearRuntimeState(callback?: (err: Error) => void): void {
     // Patterns covering all volatile call-session keys:
-    //   pf.*  → private floor locks
-    //   gf.*  → group floor locks
+    //   pf.*   → private floor locks
+    //   gf.*   → group floor locks
     //   u.*.ac → per-user active-call hash
     //   u.*.ag → per-user active-groups set
     //   g.*.ap → per-group active-participants set
-    const patterns = ["pf.*", "gf.*", "u.*.ac", "u.*.ag", "g.*.ap"];
+    //   op.*   → operation dedup keys (START/STOP idempotency, 15s TTL).
+    //            These MUST be cleared on restart: the app retries the last
+    //            in-flight START with the same operationId after reconnecting,
+    //            and withOperationDedupe silently drops it if the op.* key
+    //            still exists — so the post-restart call never reaches the receiver.
+    const patterns = ["pf.*", "gf.*", "u.*.ac", "u.*.ag", "g.*.ap", "op.*"];
     let pending = patterns.length;
     let firstErr: Error = null;
 

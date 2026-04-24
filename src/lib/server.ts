@@ -60,12 +60,14 @@ class Server implements IServer {
 
     States.setMemored(opts.memo);
     States.periodicInspect();
-    if (WORKER_NUMBER.toString() === "1") {
-        Redis.clearRuntimeState();
-        Redis.periodicClean();
-    }
+    Redis.periodicClean();
 
-    // WSS & WS SETUP
+    // WSS & WS SETUP — bind the port immediately so the OS accepts the TCP
+    // handshake, but defer the 'connection' event handler until after
+    // clearRuntimeState() completes.  This eliminates the race where a
+    // reconnecting client retransmits the same operationId before the op.*
+    // dedup key is swept from Redis, causing withOperationDedupe to silently
+    // drop the first post-restart START (caller presses PTT, receiver never rings).
     if (opts.server) {
       this.wss = new WebSocket.Server({ server: opts.server, verifyClient: this.verify.bind(this) });
       logger.info("WebSocket.Server is created");
@@ -74,7 +76,23 @@ class Server implements IServer {
       logger.info(`WebSocket.Server is created at port ${opts.port}`);
     }
 
-    this.wss.on("connection", this.handleWssConnection.bind(this));
+    const attachConnectionHandler = () => {
+      this.wss.on("connection", this.handleWssConnection.bind(this));
+      logger.info("WebSocket.Server: connection handler attached — ready to accept clients");
+    };
+
+    if (WORKER_NUMBER.toString() === "1") {
+      // Worker 1 is responsible for clearing stale Redis state. Defer the
+      // connection handler until the sweep is fully complete so that no client
+      // can reconnect before op.* (and other volatile) keys are gone.
+      Redis.clearRuntimeState(() => {
+        attachConnectionHandler();
+      });
+    } else {
+      // Other workers don't run clearRuntimeState; they can accept connections
+      // immediately (their in-memory state is already fresh after restart).
+      attachConnectionHandler();
+    }
   }
 
   // IServer Implementation
