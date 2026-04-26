@@ -352,7 +352,7 @@ export default class Client extends EventEmitter {
                 }
                 logger.info(`handlePrivateStartMessage: SOS override — ending existing call for ${msg.toId}`);
                 this.executeCallOverrideForUser(msg.toId, targetDetails, () => {
-                  this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt);
+                  setTimeout(() => this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt), 800);
                 });
               });
             }
@@ -375,7 +375,7 @@ export default class Client extends EventEmitter {
             // SOS overrides a normal call: end the target's existing call first.
             logger.info(`handlePrivateStartMessage: SOS override — ending existing call for ${msg.toId}`);
             this.executeCallOverrideForUser(msg.toId, targetDetails, () => {
-              this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt);
+              setTimeout(() => this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt), 800);
             });
             return;
           }
@@ -544,9 +544,10 @@ export default class Client extends EventEmitter {
       States.clearUserPrivateCall(userId);
       States.clearUserPrivateCall(currentCall.targetId);
       States.releasePrivateFloorOwnershipForUser(userId);
-      // Notify BOTH sides of the private call so their UIs reset.
-      this.sendDropCallToUser(userId, currentCall.targetId, 1, 0);
-      this.sendDropCallToUser(currentCall.targetId, userId, 1, 0);
+      // Notify BOTH sides. The DropCall delivered TO userId carries isSosOverride=true so
+      // the mobile keeps its service alive and can receive the SOS START ~800ms later.
+      this.sendDropCallToUser(userId, currentCall.targetId, 1, 0, undefined, false);
+      this.sendDropCallToUser(currentCall.targetId, userId, 1, 0, undefined, true);
       // IMPORTANT: must call callback() here so that Q.all(overrides) resolves
       // and proceed() forwards the SOS START to the group.  Without this the
       // SOS call is silently swallowed and the group floor leaks until TTL.
@@ -557,10 +558,11 @@ export default class Client extends EventEmitter {
       // checks don't see them as still busy in the group they are being ejected from.
       States.clearUserActiveCall(userId);
       States.removeUserFromActiveCallGroup(userId, groupId, (err, count) => {
-        // 1. Notify the specific user to reset their UI
-        this.sendDropCallToUser("System", groupId, 2, count, userId);
+        // 1. Targeted DropCall to the overridden user with isSosOverride=true so
+        //    their service stays alive for the incoming SOS START.
+        this.sendDropCallToUser("System", groupId, 2, count, userId, true);
 
-        // 2. Notify the rest of the group about the participant drop
+        // 2. Broadcast DropCall to the rest of the group (no SOS override for them).
         this.sendDropCallToUser(userId, groupId, 2, count);
 
         // Invoke callback only after async cleanup is done so the new SOS call
@@ -576,14 +578,15 @@ export default class Client extends EventEmitter {
     toId: numberOrString,
     channelType: number,
     membersInCall: number = 0,
-    deliveryId?: numberOrString
+    deliveryId?: numberOrString,
+    isSosOverride: boolean = false
   ) {
     const dropMsg = {
       channelType,
       fromId,
       messageId: JSON.stringify({
         callId: toId.toString(),
-        errorType: "",
+        errorType: isSosOverride ? "SosOverride" : "",
         lang: "",
         membersInCall,
         textMessageType: "DropCall",
@@ -1263,7 +1266,7 @@ export default class Client extends EventEmitter {
                 const d = Q.defer();
                 o(() => d.resolve(null));
                 return d.promise;
-              })).then(proceed);
+              })).then(() => setTimeout(proceed, 800));
             } else {
               proceed();
             }
@@ -1273,14 +1276,17 @@ export default class Client extends EventEmitter {
           });
         };
 
-        if (!isInterrupt) {
+        // Both SOS and interrupt must preempt the current floor owner; otherwise
+        // acknowledgeGroupStartMessage will fail to acquire the floor and the call
+        // is silently dropped while someone is speaking.
+        if (!isInterrupt && !isSos) {
           acquireFloorAndProceed();
           return;
         }
 
         States.getBusyStateOfGroup(msg.toId, (ownerErr, floorOwnerId) => {
           if (ownerErr) {
-            logger.info(`handleGroupStartMessage: failed to inspect floor owner for interrupt` +
+            logger.info(`handleGroupStartMessage: failed to inspect floor owner for SOS/interrupt` +
                         ` group ${msg.toId} err ${ownerErr}`);
             acquireFloorAndProceed();
             return;
@@ -1292,7 +1298,7 @@ export default class Client extends EventEmitter {
             return;
           }
 
-          logger.info(`handleGroupStartMessage: interrupt START from ${msg.fromId}` +
+          logger.info(`handleGroupStartMessage: ${isSos ? "SOS" : "interrupt"} START from ${msg.fromId}` +
                       ` preempting floor owner ${floorOwnerIdStr} in group ${msg.toId}`);
           this.forceStopCurrentGroupFloorOwner(msg.toId, floorOwnerIdStr, acquireFloorAndProceed);
         });
