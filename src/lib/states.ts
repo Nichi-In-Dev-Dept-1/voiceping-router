@@ -260,6 +260,7 @@ export default class States {
       delete userGroupCallState[userId + ""];
     }
     Redis.removeActiveGroupForUser(userId, groupId);
+    States.removeUserFromGroupFloorRecipients(groupId, userId);
     return States.removeActiveParticipantFromGroup(groupId, userId, callback);
   }
 
@@ -361,6 +362,7 @@ export default class States {
           ` users:${JSON.stringify(groupsActiveParticipantsSet[groupId])}`
         );
         Redis.removeActiveParticipantFromGroup(groupId, userId);
+        States.removeUserFromGroupFloorRecipients(groupId, userId);
       });
       if (callback) { return callback(null, groupIds); }
     };
@@ -470,7 +472,15 @@ export default class States {
     // 2. In-memory private call state — reliable even when Redis is unavailable.
     const ps = userPrivateCallState[uid];
     if (ps) {
-      return callback(null, { inCall: true, channelType: 1, targetId: ps.peerId, isSos: ps.isSos });
+      // Guard against stale state where peerId is the SDK heartbeat target ("00000", "0", empty).
+      // Such state can never represent a real call and would make this user appear permanently busy.
+      const peerIdStr = (ps.peerId || "").toString().replace(/^0+$/, "0");
+      if (!ps.peerId || peerIdStr === "0" || peerIdStr === "00000") {
+        delete userPrivateCallState[uid];
+        Redis.clearActiveCall(uid);
+      } else {
+        return callback(null, { inCall: true, channelType: 1, targetId: ps.peerId, isSos: ps.isSos });
+      }
     }
 
     // 3. Redis fallback — catches calls established on a different worker process
@@ -565,6 +575,22 @@ export default class States {
     if (!session) { return undefined; }
     if (ownerId !== undefined && session.ownerId !== ownerId + "") { return undefined; }
     return session.recipients;
+  }
+
+  // Remove a single user from the current floor's recipient list (DropCall / disconnect).
+  // The floor session itself stays intact — only this user stops receiving audio.
+  public static removeUserFromGroupFloorRecipients(groupId: numberOrString, userId: numberOrString): void {
+    const session = groupFloorRecipients[groupId + ""];
+    if (!session) { return; }
+    const uid = userId + "";
+    session.recipients = session.recipients.filter((r) => r !== uid);
+  }
+
+  // Returns true if the user explicitly left this call session via DropCall.
+  // Cleared by clearActiveCallGroup (CallEndedForAll) so the user is eligible again for the next call.
+  public static isUserDroppedFromGroup(userId: numberOrString, groupId: numberOrString): boolean {
+    const dropped = (groupsDroppedParticipantsSet[groupId + ""] || []).map((id) => id + "");
+    return dropped.includes(userId + "");
   }
 
   /** Clear recipient restriction when the floor is released. */

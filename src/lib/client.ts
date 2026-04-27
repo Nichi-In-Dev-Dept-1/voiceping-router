@@ -1187,7 +1187,13 @@ export default class Client extends EventEmitter {
           if (!res) { return; }
           const { uid, details } = res;
           if (!details.inCall) {
-            availableRecipients.push(uid);
+            // Skip members who explicitly left this call session via DropCall.
+            // They are excluded until CallEndedForAll resets the dropped set for the group.
+            if (States.isUserDroppedFromGroup(uid, msg.toId)) {
+              logger.info(`handleGroupStartMessage: skipping dropped member ${uid} for group ${msg.toId}`);
+            } else {
+              availableRecipients.push(uid);
+            }
           } else if (details.channelType === 2 && details.targetId === msg.toId.toString()) {
             // Already in this same group call — include them so they hear the new floor owner.
             availableRecipients.push(uid);
@@ -1467,10 +1473,15 @@ export default class Client extends EventEmitter {
         // listener to be removed before the EndCall message is dispatched.
         States.getCallDetailsForUser(this.id, (err2, details) => {
           if (!err2 && details.inCall && details.channelType === 1) {
-            // Notify the peer that this user disconnected so their UI resets and
-            // they stop transmitting audio to a now-dead socket.
-            this.sendDropCallToUser(this.id, details.targetId, 1, 0);
-            States.clearUserPrivateCall(details.targetId);
+            // Guard against stale "00000" peer — sending DROP to an invalid target causes
+            // unnecessary lookup noise and signals a ghost user that never existed.
+            const targetIdStr = (details.targetId || "").toString().replace(/^0+$/, "0");
+            if (details.targetId && targetIdStr !== "0" && targetIdStr !== "00000") {
+              // Notify the peer that this user disconnected so their UI resets and
+              // they stop transmitting audio to a now-dead socket.
+              this.sendDropCallToUser(this.id, details.targetId, 1, 0);
+              States.clearUserPrivateCall(details.targetId);
+            }
           }
           States.clearUserActiveCall(this.id);
           // Emit unregister AFTER sendEndCallToUser so the server's "message"
