@@ -562,9 +562,11 @@ export default class Client extends EventEmitter {
         //    their service stays alive for the incoming SOS START.
         this.sendDropCallToUser("System", groupId, 2, count, userId, true);
 
-        // 2. Broadcast DropCall to the rest of the group (no SOS override for them).
-        this.sendDropCallToUser(userId, groupId, 2, count);
-
+        // Do NOT broadcast DropCall to the rest of the group. This prevents 
+        // non-SOS participants from being disconnected due to low participant count
+        // (the "count < 2" logic on the client). They should continue their 
+        // normal call session in isolation from the SOS call.
+        
         // Invoke callback only after async cleanup is done so the new SOS call
         // doesn't start connecting before this user has been fully ejected.
         callback();
