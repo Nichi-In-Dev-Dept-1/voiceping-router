@@ -1187,9 +1187,10 @@ export default class Client extends EventEmitter {
           if (!res) { return; }
           const { uid, details } = res;
           if (!details.inCall) {
-            // Skip members who explicitly left this call session via DropCall.
-            // They are excluded until CallEndedForAll resets the dropped set for the group.
-            if (States.isUserDroppedFromGroup(uid, msg.toId)) {
+            // Skip members who explicitly left this call session via DropCall,
+            // UNLESS this is an SOS — emergencies reach everyone.
+            // Dropped set is cleared by CallEndedForAll so they rejoin the next fresh call.
+            if (States.isUserDroppedFromGroup(uid, msg.toId) && !isSos) {
               logger.info(`handleGroupStartMessage: skipping dropped member ${uid} for group ${msg.toId}`);
             } else {
               availableRecipients.push(uid);
