@@ -844,7 +844,44 @@ export default class States {
           return callback(null, true, userId);
         });
       } else {
-        return callback(null, false, currentOwner || "0");
+        const ownerStr = (currentOwner || "").toString();
+        // Fast-path stale-floor detection: if the Redis key claims a floor owner but that
+        // owner has already released in local memory (groupFloorKeysByUser cleared by
+        // releaseFloorOfGroup), the Redis Lua script just hasn't completed yet (~100 ms
+        // after a STOP). This is the race that causes receivers to get START_FAILED
+        // immediately after the SOS caller's first talk ends.
+        // Fix: if the claimed owner holds no local floor key for this group, treat the
+        // Redis key as stale, force-release it, and retry acquisition once.
+        if (ownerStr && ownerStr !== "0" && ownerStr !== userIdStr) {
+          const ownerHoldsLocalFloor = groupFloorKeysByUser[ownerStr] &&
+            groupFloorKeysByUser[ownerStr].has(groupIdStr);
+          if (!ownerHoldsLocalFloor) {
+            debug(`acquireFloorOfGroup: Redis floor for group ${groupIdStr} claims owner ${ownerStr}` +
+                  ` but owner has no local floor key — stale Redis entry, force-releasing and retrying`);
+            return Redis.releaseGroupFloor(groupIdStr, ownerStr, () => {
+              // Retry once after clearing the stale Redis key.
+              Redis.acquireGroupFloor(groupIdStr, userIdStr, GROUP_FLOOR_TTL_SEC,
+                (retryErr, retryAcquired, retryOwner) => {
+                if (retryErr) { return callback(retryErr, false, 0); }
+                if (retryAcquired) {
+                  if (!groupFloorKeysByUser[userIdStr]) { groupFloorKeysByUser[userIdStr] = new Set(); }
+                  groupFloorKeysByUser[userIdStr].add(groupIdStr);
+                  States.setBusyStateOfGroup(groupIdStr, userIdStr, (setErr2) => {
+                    if (setErr2) {
+                      Redis.releaseGroupFloor(groupIdStr, userIdStr);
+                      groupFloorKeysByUser[userIdStr].delete(groupIdStr);
+                      return callback(setErr2, false, userId);
+                    }
+                    return callback(null, true, userId);
+                  });
+                } else {
+                  return callback(null, false, retryOwner || "0");
+                }
+              });
+            });
+          }
+        }
+        return callback(null, false, ownerStr || "0");
       }
     });
   }
