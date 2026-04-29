@@ -562,11 +562,11 @@ export default class Client extends EventEmitter {
         //    their service stays alive for the incoming SOS START.
         this.sendDropCallToUser("System", groupId, 2, count, userId, true);
 
-        // Do NOT broadcast DropCall to the rest of the group. This prevents 
+        // Do NOT broadcast DropCall to the rest of the group. This prevents
         // non-SOS participants from being disconnected due to low participant count
-        // (the "count < 2" logic on the client). They should continue their 
+        // (the "count < 2" logic on the client). They should continue their
         // normal call session in isolation from the SOS call.
-        
+
         // Invoke callback only after async cleanup is done so the new SOS call
         // doesn't start connecting before this user has been fully ejected.
         callback();
@@ -1246,7 +1246,13 @@ export default class Client extends EventEmitter {
               return;
             }
 
-            States.setGroupSos(msg.toId, isSos);
+            // Fix #3: Only set the group SOS flag to true; never clear it while the
+            // session is active. Receivers PTT with isSos=false (the Android client strips
+            // the flag for non-callers so the router doesn't re-trigger SOS preemption on
+            // every receiver press). Without this guard a receiver's first PTT would reset
+            // setGroupSos(groupId, false), breaking SOS-priority for late-joining members
+            // and future overlap detection for that group for the rest of the session.
+            if (isSos) { States.setGroupSos(msg.toId, true); }
             States.setUserGroupCallState(msg.fromId, msg.toId, isSos);
             States.addUserToActiveCallGroup(msg.fromId, msg.toId, isSos);
 
