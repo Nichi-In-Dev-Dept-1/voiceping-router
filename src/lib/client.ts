@@ -340,9 +340,14 @@ export default class Client extends EventEmitter {
                   this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt);
                   return;
                 }
-                if (!newCallIsSos || targetDetails.isSos) {
-                  logger.info(`handlePrivateStartMessage: target ${msg.toId} busy` +
-                              ` (existingSos=${targetDetails.isSos} newSos=${newCallIsSos}) — rejecting ${msg.fromId}`);
+                // Allow SOS or warikomi (interrupt) to override a busy target.
+                // Normal calls are always rejected when target is in a non-SOS call.
+                if ((!newCallIsSos && !newCallIsInterrupt) || targetDetails.isSos) {
+                  logger.info(
+                    `handlePrivateStartMessage: target ${msg.toId} busy` +
+                    ` (existingSos=${targetDetails.isSos} newSos=${newCallIsSos}` +
+                    ` newInterrupt=${newCallIsInterrupt}) — rejecting ${msg.fromId}`
+                  );
                   this.message({
                     channelType: msg.channelType, fromId: msg.fromId,
                     messageType: MessageType.START_FAILED, payload: "Busy", toId: msg.toId
@@ -352,15 +357,15 @@ export default class Client extends EventEmitter {
                 }
                 logger.info(`handlePrivateStartMessage: SOS override — ending existing call for ${msg.toId}`);
                 this.executeCallOverrideForUser(msg.toId, targetDetails, () => {
-                  setTimeout(() => this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt), 800);
+                  this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt);
                 });
               });
             }
 
-            if (!newCallIsSos || targetDetails.isSos) {
-              // Reject: normal→any or sos→sos
+            if ((!newCallIsSos && !newCallIsInterrupt) || targetDetails.isSos) {
+              // Reject: normal→any or sos→sos or interrupt→sos
               logger.info(`handlePrivateStartMessage: target ${msg.toId} busy (existingSos=${targetDetails.isSos}` +
-                          ` newSos=${newCallIsSos}) — rejecting ${msg.fromId}`);
+                          ` newSos=${newCallIsSos} newInterrupt=${newCallIsInterrupt}) — rejecting ${msg.fromId}`);
               this.message({
                 channelType: msg.channelType,
                 fromId: msg.fromId,
@@ -375,7 +380,7 @@ export default class Client extends EventEmitter {
             // SOS overrides a normal call: end the target's existing call first.
             logger.info(`handlePrivateStartMessage: SOS override — ending existing call for ${msg.toId}`);
             this.executeCallOverrideForUser(msg.toId, targetDetails, () => {
-              setTimeout(() => this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt), 800);
+              this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt);
             });
             return;
           }
@@ -557,18 +562,23 @@ export default class Client extends EventEmitter {
       // Clear the user's Redis active-call key immediately so subsequent overlap
       // checks don't see them as still busy in the group they are being ejected from.
       States.clearUserActiveCall(userId);
+      // Release the group floor if this user holds it. Without this the floor stays
+      // locked until TTL, blocking the remaining group members from speaking.
+      States.releaseFloorOfGroup(groupId, userId);
       States.removeUserFromActiveCallGroup(userId, groupId, (err, count) => {
         // 1. Targeted DropCall to the overridden user with isSosOverride=true so
         //    their service stays alive for the incoming SOS START.
         this.sendDropCallToUser("System", groupId, 2, count, userId, true);
 
-        // Do NOT broadcast DropCall to the rest of the group. This prevents
-        // non-SOS participants from being disconnected due to low participant count
-        // (the "count < 2" logic on the client). They should continue their
-        // normal call session in isolation from the SOS call.
+        // Notify remaining group members of the reduced participant count.
+        States.getActiveParticipantsOfGroup(groupId, (apErr, remaining) => {
+          (remaining || []).forEach((pid) => {
+            if (pid.toString() !== userId.toString()) {
+              this.sendDropCallToUser(userId + "", groupId, 2, count, pid, false);
+            }
+          });
+        });
 
-        // Invoke callback only after async cleanup is done so the new SOS call
-        // doesn't start connecting before this user has been fully ejected.
         callback();
       });
     }
@@ -1198,8 +1208,12 @@ export default class Client extends EventEmitter {
               availableRecipients.push(uid);
             }
           } else if (details.channelType === 2 && details.targetId === msg.toId.toString()) {
-            // Already in this same group call — include them so they hear the new floor owner.
+            // Already in this same group call — include them.
             availableRecipients.push(uid);
+            if (isSos && !details.isSos) {
+              // SOS overrides a normal call even in the same group to ensure UI visibility.
+              overrides.push((done) => this.executeCallOverrideForUser(uid, details, done));
+            }
           } else if (isSos && !details.isSos) {
             // SOS overrides a normal call in a different channel.
             availableRecipients.push(uid);
@@ -1253,6 +1267,17 @@ export default class Client extends EventEmitter {
             // setGroupSos(groupId, false), breaking SOS-priority for late-joining members
             // and future overlap detection for that group for the rest of the session.
             if (isSos) { States.setGroupSos(msg.toId, true); }
+            // If the sender was in a different group call before starting this one,
+            // clean up their old group membership so remaining members aren't left
+            // with stale state (stale floor owner, wrong participant count).
+            States.getActiveCallGroupsOfUser(msg.fromId, (gsErr, prevGroups) => {
+              (prevGroups || []).forEach((prevGroupId) => {
+                if (prevGroupId.toString() !== msg.toId.toString()) {
+                  States.releaseFloorOfGroup(prevGroupId, msg.fromId + "");
+                  States.removeUserFromActiveCallGroup(msg.fromId, prevGroupId);
+                }
+              });
+            });
             States.setUserGroupCallState(msg.fromId, msg.toId, isSos);
             States.addUserToActiveCallGroup(msg.fromId, msg.toId, isSos);
 
@@ -1281,7 +1306,7 @@ export default class Client extends EventEmitter {
                 const d = Q.defer();
                 o(() => d.resolve(null));
                 return d.promise;
-              })).then(() => setTimeout(proceed, 800));
+              })).then(() => proceed());
             } else {
               proceed();
             }
