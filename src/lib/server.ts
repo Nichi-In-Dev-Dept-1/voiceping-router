@@ -413,7 +413,10 @@ class Server implements IServer {
     try {
       const meta = JSON.parse(msg.messageId);
       const textType = meta && meta.textMessageType;
-      return textType === "BusyEvent" || textType === "DropCall" || textType === "CallEndedForAll";
+      return textType === "BusyEvent" ||
+        textType === "OverlapMissedCall" ||
+        textType === "DropCall" ||
+        textType === "CallEndedForAll";
     } catch (e) {
       return false;
     }

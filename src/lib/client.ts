@@ -23,6 +23,7 @@ function debug(msg: string) {
 
 const PING_INTERVAL: number = config.pingInterval;
 const PING_TIMEOUT: number = config.pingTimeout;
+const OVERLAP_MISSED_CALL_DEDUPE_TTL_MS = 30000;
 
 interface IConnections {
   [index: string]: Connection;
@@ -48,6 +49,8 @@ export default class Client extends EventEmitter {
   // completes (race condition on quick tap-and-release) can be buffered and replayed.
   private pendingGroupStart: Map<string, IMessage> = new Map();
   private pendingGroupStop: Map<string, IMessage> = new Map();
+  private overlapMissedCallKeys: Set<string> = new Set();
+  private overlapMissedCallKeyTimers: Map<string, NodeJS.Timer> = new Map();
 
   constructor(id: numberOrString, user: any, server: IServer) {
     super();
@@ -348,6 +351,7 @@ export default class Client extends EventEmitter {
                     ` (existingSos=${targetDetails.isSos} newSos=${newCallIsSos}` +
                     ` newInterrupt=${newCallIsInterrupt}) — rejecting ${msg.fromId}`
                   );
+                  this.sendOverlapMissedCallText(msg, msg.toId);
                   this.message({
                     channelType: msg.channelType, fromId: msg.fromId,
                     messageType: MessageType.START_FAILED, payload: "Busy", toId: msg.toId
@@ -366,6 +370,7 @@ export default class Client extends EventEmitter {
               // Reject: normal→any or sos→sos or interrupt→sos
               logger.info(`handlePrivateStartMessage: target ${msg.toId} busy (existingSos=${targetDetails.isSos}` +
                           ` newSos=${newCallIsSos} newInterrupt=${newCallIsInterrupt}) — rejecting ${msg.fromId}`);
+              this.sendOverlapMissedCallText(msg, msg.toId);
               this.message({
                 channelType: msg.channelType,
                 fromId: msg.fromId,
@@ -668,6 +673,90 @@ export default class Client extends EventEmitter {
     }
   }
 
+  private getOverlapMissedCallKey(this: Client, msg: IMessage, recipientId: numberOrString): string {
+    if (msg.channelType === ChannelType.GROUP) {
+      return `${msg.channelType}:${msg.toId}:${recipientId}`;
+    }
+    return `${msg.channelType}:${msg.fromId}:${msg.toId}:${recipientId}`;
+  }
+
+  private reserveOverlapMissedCallKey(this: Client, key: string): boolean {
+    const isNew = !this.overlapMissedCallKeys.has(key);
+    this.overlapMissedCallKeys.add(key);
+
+    const existingTimer = this.overlapMissedCallKeyTimers.get(key);
+    if (existingTimer) {
+      clearTimeout(existingTimer);
+    }
+
+    const timer = setTimeout(() => {
+      this.overlapMissedCallKeys.delete(key);
+      this.overlapMissedCallKeyTimers.delete(key);
+    }, OVERLAP_MISSED_CALL_DEDUPE_TTL_MS);
+    this.overlapMissedCallKeyTimers.set(key, timer);
+
+    return isNew;
+  }
+
+  private clearOverlapMissedCallKeysByPrefix(this: Client, prefix: string): void {
+    Array.from(this.overlapMissedCallKeys)
+      .filter((key) => key.startsWith(prefix))
+      .forEach((key) => {
+        this.overlapMissedCallKeys.delete(key);
+        const timer = this.overlapMissedCallKeyTimers.get(key);
+        if (timer) {
+          clearTimeout(timer);
+          this.overlapMissedCallKeyTimers.delete(key);
+        }
+      });
+  }
+
+  private clearOverlapMissedCallKeysForTextMessage(this: Client, msg: IMessage, meta: ITextMessageMeta): void {
+    if (!meta || !meta.textMessageType) { return; }
+    if (msg.channelType === ChannelType.GROUP && meta.textMessageType === "CallEndedForAll") {
+      this.clearOverlapMissedCallKeysByPrefix(`${ChannelType.GROUP}:${msg.toId}:`);
+      return;
+    }
+    if (msg.channelType === ChannelType.PRIVATE &&
+        (meta.textMessageType === "EndCall" || meta.textMessageType === "DropCall")) {
+      this.clearOverlapMissedCallKeysByPrefix(`${ChannelType.PRIVATE}:${msg.fromId}:${msg.toId}:`);
+      this.clearOverlapMissedCallKeysByPrefix(`${ChannelType.PRIVATE}:${msg.toId}:${msg.fromId}:`);
+    }
+  }
+
+  private sendOverlapMissedCallText(this: Client, msg: IMessage, recipientId: numberOrString): void {
+    const key = this.getOverlapMissedCallKey(msg, recipientId);
+    if (!this.reserveOverlapMissedCallKey(key)) {
+      logger.info(`sendOverlapMissedCallText: duplicate skipped key=${key}`);
+      return;
+    }
+
+    const isGroup = msg.channelType === ChannelType.GROUP;
+    const callId = isGroup ? msg.toId.toString() : msg.fromId.toString();
+    const missedMsg = {
+      channelType: msg.channelType,
+      fromId: msg.fromId,
+      messageId: JSON.stringify({
+        callId,
+        errorType: "OverlapCall",
+        lang: "",
+        membersInCall: 0,
+        textMessageType: "OverlapMissedCall",
+        translate: false
+      }),
+      messageType: MessageType.TEXT,
+      payload: JSON.stringify({
+        message_id: key,
+        text: JSON.stringify({ callId, dedupeKey: key })
+      }),
+      toId: isGroup ? msg.toId : recipientId
+    };
+
+    logger.info(`sendOverlapMissedCallText: notifying busy recipient ${recipientId}` +
+                ` for callId=${callId} key=${key}`);
+    this.server.sendMessageToUser(missedMsg, recipientId);
+  }
+
   /** Parses the START message payload when the caller sends JSON metadata. */
   private parseStartPayload(this: Client, msg: IMessage): any | null {
     try {
@@ -853,6 +942,9 @@ export default class Client extends EventEmitter {
         (earlyMeta.textMessageType === "EndCall" || earlyMeta.textMessageType === "DropCall")) {
       States.clearUserPrivateCall(msg.fromId);
       States.clearUserPrivateCall(msg.toId);
+    }
+    if (earlyMeta) {
+      this.clearOverlapMissedCallKeysForTextMessage(msg, earlyMeta);
     }
 
     Recorder.save(msg, (err, messageId) => {
@@ -1193,6 +1285,7 @@ export default class Client extends EventEmitter {
 
       Q.all(checkPromises).then((results) => {
         const availableRecipients: numberOrString[] = [];
+        const overlapMissedRecipients: numberOrString[] = [];
         const overrides: Array<(done: () => void) => void> = [];
 
         results.forEach((res: any) => {
@@ -1232,9 +1325,12 @@ export default class Client extends EventEmitter {
               logger.info(`handleGroupStartMessage: skipping busy member ${uid}` +
                           ` (sos=${details.isSos} newSos=${isSos}` +
                           ` theirChannel=${details.channelType} theirTarget=${details.targetId})`);
+              overlapMissedRecipients.push(uid);
             }
           }
         });
+
+        overlapMissedRecipients.forEach((uid) => this.sendOverlapMissedCallText(msg, uid));
 
         // ── Step 2: If ALL members are busy, reject immediately — no floor acquired yet.
         if (availableRecipients.length === 0 && overrides.length === 0) {
