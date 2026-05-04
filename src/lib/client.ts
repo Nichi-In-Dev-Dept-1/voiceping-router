@@ -330,40 +330,30 @@ export default class Client extends EventEmitter {
               return;
             }
 
-            // Peer appears connected in a private call. Verify the floor is still held —
-            // if the call ended client-side without a STOP the floor expires but in-call
-            // state lingers, blocking all subsequent calls until TTL.
+            // Peer appears connected in a private call. We rely on the session TTL
+            // rather than the floor lock so we do not drop the call during silence between turns.
             if (targetDetails.channelType === 1) {
-              return this.isPrivateCallFloorHeld(msg.toId, targetDetails.targetId, (held) => {
-                if (!held) {
-                  logger.info(`handlePrivateStartMessage: target ${msg.toId} has stale in-call state` +
-                              ` with connected peer ${targetDetails.targetId} (no floor held) — clearing`);
-                  States.clearUserPrivateCall(msg.toId);
-                  States.clearUserPrivateCall(targetDetails.targetId);
-                  this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt);
-                  return;
-                }
-                // Allow SOS or warikomi (interrupt) to override a busy target.
-                // Normal calls are always rejected when target is in a non-SOS call.
-                if ((!newCallIsSos && !newCallIsInterrupt) || targetDetails.isSos) {
-                  logger.info(
-                    `handlePrivateStartMessage: target ${msg.toId} busy` +
-                    ` (existingSos=${targetDetails.isSos} newSos=${newCallIsSos}` +
-                    ` newInterrupt=${newCallIsInterrupt}) — rejecting ${msg.fromId}`
-                  );
-                  this.sendOverlapMissedCallText(msg, msg.toId);
-                  this.message({
-                    channelType: msg.channelType, fromId: msg.fromId,
-                    messageType: MessageType.START_FAILED, payload: "Busy", toId: msg.toId
-                  });
-                  this.sendBusyEventText(msg, "Busy");
-                  return;
-                }
-                logger.info(`handlePrivateStartMessage: SOS override — ending existing call for ${msg.toId}`);
-                this.executeCallOverrideForUser(msg.toId, targetDetails, () => {
-                  this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt);
+              // Allow SOS or warikomi (interrupt) to override a busy target.
+              // Normal calls are always rejected when target is in a non-SOS call.
+              if ((!newCallIsSos && !newCallIsInterrupt) || targetDetails.isSos) {
+                logger.info(
+                  `handlePrivateStartMessage: target ${msg.toId} busy` +
+                  ` (existingSos=${targetDetails.isSos} newSos=${newCallIsSos}` +
+                  ` newInterrupt=${newCallIsInterrupt}) — rejecting ${msg.fromId}`
+                );
+                this.sendOverlapMissedCallText(msg, msg.toId);
+                this.message({
+                  channelType: msg.channelType, fromId: msg.fromId,
+                  messageType: MessageType.START_FAILED, payload: "Busy", toId: msg.toId
                 });
+                this.sendBusyEventText(msg, "Busy");
+                return;
+              }
+              logger.info(`handlePrivateStartMessage: SOS override — ending existing call for ${msg.toId}`);
+              this.executeCallOverrideForUser(msg.toId, targetDetails, () => {
+                this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt);
               });
+              return;
             }
 
             if ((!newCallIsSos && !newCallIsInterrupt) || targetDetails.isSos) {
@@ -406,26 +396,15 @@ export default class Client extends EventEmitter {
             doTargetCheck();
             return;
           }
-          // Peer appears connected in a private call. Verify floor is still held before
-          // rejecting — otherwise a call that ended without a STOP blocks the sender forever.
+          // If the sender themselves is initiating a new private call, they are leaving
+          // their previous call client-side. We clear the previous state and proceed.
           if (senderDetails.channelType === 1) {
-            return this.isPrivateCallFloorHeld(msg.fromId, senderDetails.targetId, (held) => {
-              if (!held) {
-                logger.info(`handlePrivateStartMessage: sender ${msg.fromId} has stale in-call state` +
-                            ` with connected peer ${senderDetails.targetId} (no floor held) — clearing`);
-                States.clearUserPrivateCall(msg.fromId);
-                States.clearUserPrivateCall(senderDetails.targetId);
-                doTargetCheck();
-                return;
-              }
-              logger.info(`handlePrivateStartMessage: sender ${msg.fromId} is busy with` +
-                          ` ${senderDetails.targetId} — rejecting call to ${msg.toId}`);
-              this.message({
-                channelType: msg.channelType, fromId: msg.fromId,
-                messageType: MessageType.START_FAILED, payload: "Busy", toId: msg.toId
-              });
-              this.sendBusyEventText(msg, "Busy");
-            });
+            logger.info(`handlePrivateStartMessage: sender ${msg.fromId} initiating new call to ${msg.toId}` +
+                        ` — clearing previous private call state with ${senderDetails.targetId}`);
+            States.clearUserPrivateCall(msg.fromId);
+            States.clearUserPrivateCall(senderDetails.targetId);
+            doTargetCheck();
+            return;
           }
           // Group-type busy — reject immediately (floor check not applicable for group floors).
           logger.info(`handlePrivateStartMessage: sender ${msg.fromId} is busy with` +
