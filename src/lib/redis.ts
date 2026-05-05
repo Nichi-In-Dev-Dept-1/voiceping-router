@@ -22,7 +22,8 @@ let cleanInterval: NodeJS.Timer;
 let cleanGroup: number = 1;
 
 // TTL for active-call Redis entries — auto-expires stale entries after busyTimeout seconds.
-const ACTIVE_STATE_TTL = Math.ceil(config.group.busyTimeout / 1000);
+// Match the private/group floor TTL so ac keys never outlive their floor lock
+const ACTIVE_STATE_TTL = Math.ceil((config.group.busyTimeout / 1000) + 30);
 const SIGNALING_OUTBOX_MAX_ITEMS = 200;
 // 15 s is long enough to prevent duplicate processing of a retried START,
 // but short enough that a failed attempt (Redis error, floor-acquire error)

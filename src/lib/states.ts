@@ -518,6 +518,23 @@ export default class States {
             }
             return callback(null, { inCall: false, channelType: 0, targetId: "", isSos: false });
           }
+
+          const floorKey = privateFloorKey(uid, targetId);
+          return Redis.getPrivateFloorOwner(floorKey, (floorErr, owner) => {
+            if (!floorErr && !owner) {
+              debug(`getCallDetailsForUser: private floor for ${uid}↔${targetId} is free ` +
+                    `but ac key claims inCall — clearing stale state`);
+              delete userPrivateCallState[uid];
+              Redis.clearActiveCall(uid);
+              return callback(null, { inCall: false, channelType: 0, targetId: "", isSos: false });
+            }
+            return callback(null, {
+              channelType: ac.channelType,
+              inCall: true,
+              isSos: !!ac.isSos,
+              targetId
+            });
+          });
         }
         return callback(null, {
           channelType: ac.channelType,
