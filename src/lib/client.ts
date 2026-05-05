@@ -1367,12 +1367,16 @@ export default class Client extends EventEmitter {
               this.server.sendMessageToGroupSubset(msg, availableRecipients);
 
               // Process a buffered STOP so quick tap-and-release always sends START then STOP.
+              // Delay by 400ms so the receiver has time to process the START before STOP arrives —
+              // without this, both messages land near-simultaneously and the receiver's async
+              // handleIncomingCall() coroutine is aborted by the guard before it can broadcast
+              // the call UI, leaving the receiver never seeing the call at all.
               const bufferedStop = this.pendingGroupStop.get(startStopKey);
               if (bufferedStop) {
                 this.pendingGroupStop.delete(startStopKey);
                 logger.info(`handleGroupStartMessage: processing buffered STOP for` +
-                            ` user ${msg.fromId} group ${msg.toId} (quick tap-and-release)`);
-                this.finishStopMessage(bufferedStop);
+                            ` user ${msg.fromId} group ${msg.toId} (quick tap-and-release, 400ms delay)`);
+                setTimeout(() => this.finishStopMessage(bufferedStop), 400);
               }
             };
 
