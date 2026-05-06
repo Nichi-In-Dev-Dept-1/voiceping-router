@@ -7,11 +7,13 @@ class Lgger {
 
   constructor() {
     this.logger = new Logger({
+      level: "debug",
       transports: [
         new transports.Console({
           colorize: true,
           handleExceptions: true,
           humanReadableUnhandledException: true,
+          level: "debug",
           timestamp: true
         })
       ]

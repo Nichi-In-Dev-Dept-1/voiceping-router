@@ -71,7 +71,35 @@ export default class Client extends EventEmitter {
     // also clear the peer's side.  Reading peer AFTER clearUserActiveCall would find
     // userPrivateCallState[id] already deleted and never reach the peer cleanup.
     const stalePeer = States.getPrivateCallPeer(this.id);
-    States.removeActiveParticipantFromAllGroups(this.id);
+    // Only remove from groups where the user does NOT hold the floor.
+    // If they hold the floor they are currently talking — removing them would end
+    // their transmission when a listener reconnects.
+    States.getGroupsWithActiveParticipant(this.id, (groupErr, activeGroups) => {
+      if (activeGroups && activeGroups.length > 0) {
+        const groupsToKeep: Array<number|string> = [];
+        let groupsChecked = 0;
+        activeGroups.forEach((groupId) => {
+          States.isFloorOwnerOfGroup(groupId, this.id, (floorErr, isOwner) => {
+            if (isOwner) {
+              logger.info(`registerSocket: user ${this.id} holds group floor in ${groupId}` +
+                          ` — keeping as active participant for reconnection`);
+              groupsToKeep.push(groupId);
+            }
+            groupsChecked++;
+            if (groupsChecked === activeGroups.length) {
+              // Remove from all groups, then re-add groups where user holds floor
+              States.removeActiveParticipantFromAllGroups(this.id, (removeErr) => {
+                groupsToKeep.forEach((groupToKeep) => {
+                  States.addUserToActiveCallGroup(this.id, groupToKeep, false);
+                });
+              });
+            }
+          });
+        });
+      } else {
+        States.removeActiveParticipantFromAllGroups(this.id);
+      }
+    });
     States.releaseFloorOwnershipForUser(this.id);
     States.releasePrivateFloorOwnershipForUser(this.id);
     States.clearUserActiveCall(this.id);
@@ -1587,44 +1615,75 @@ export default class Client extends EventEmitter {
       clearInterval(this.pingInterval);
       this.pingInterval = null;
       States.getGroupsWithActiveParticipant(this.id, (err, activeGroups) => {
-        States.removeActiveParticipantFromAllGroups(this.id);
-        States.releaseFloorOwnershipForUser(this.id);
-        States.releasePrivateFloorOwnershipForUser(this.id);
-        // Check private-call state first.  "unregister" MUST be emitted INSIDE this
-        // callback so the server's "message" event listener is still attached when
-        // sendEndCallToUser fires — moving emit("unregister") outside would cause the
-        // listener to be removed before the EndCall message is dispatched.
-        States.getCallDetailsForUser(this.id, (err2, details) => {
-          if (!err2 && details.inCall && details.channelType === 1) {
-            // Guard against stale "00000" peer — sending DROP to an invalid target causes
-            // unnecessary lookup noise and signals a ghost user that never existed.
-            const targetIdStr = (details.targetId || "").toString().replace(/^0+$/, "0");
-            if (details.targetId && targetIdStr !== "0" && targetIdStr !== "00000") {
-              // releasePrivateFloorOwnershipForUser(this.id) already ran above, so if the
-              // peer still holds the floor they are the active talker. Skip DropCall to avoid
-              // cutting off a transmission in progress — let them finish and release PTT naturally.
-              States.isPrivateFloorOwner(this.id, details.targetId, details.targetId, (floorErr, peerIsOwner) => {
-                if (!peerIsOwner) {
-                  // Disconnecting user was the talker (or floor was idle). Notify peer so their UI resets.
-                  this.sendDropCallToUser(this.id, details.targetId, 1, 0);
-                  States.clearUserPrivateCall(details.targetId);
-                } else {
-                  logger.info(`handleConnectionClose: peer ${details.targetId} holds private floor —` +
-                              ` skipping DropCall, clearing only self ${this.id}`);
-                }
-                States.clearUserActiveCall(this.id);
-                // Emit unregister AFTER sendEndCallToUser so the server's "message"
-                // listener is still active when the EndCall event is dispatched.
-                this.emit("unregister", this, activeGroups || []);
-              });
-              return;
+        const continueWithCloseHandling = () => {
+          States.releaseFloorOwnershipForUser(this.id);
+          States.releasePrivateFloorOwnershipForUser(this.id);
+          // Check private-call state first.  "unregister" MUST be emitted INSIDE this
+          // callback so the server's "message" event listener is still attached when
+          // sendEndCallToUser fires — moving emit("unregister") outside would cause the
+          // listener to be removed before the EndCall message is dispatched.
+          States.getCallDetailsForUser(this.id, (err2, details) => {
+            if (!err2 && details.inCall && details.channelType === 1) {
+              // Guard against stale "00000" peer — sending DROP to an invalid target causes
+              // unnecessary lookup noise and signals a ghost user that never existed.
+              const targetIdStr = (details.targetId || "").toString().replace(/^0+$/, "0");
+              if (details.targetId && targetIdStr !== "0" && targetIdStr !== "00000") {
+                // releasePrivateFloorOwnershipForUser(this.id) already ran above, so if the
+                // peer still holds the floor they are the active talker. Skip DropCall to avoid
+                // cutting off a transmission in progress — let them finish and release PTT naturally.
+                States.isPrivateFloorOwner(this.id, details.targetId, details.targetId, (floorErr, peerIsOwner) => {
+                  if (!peerIsOwner) {
+                    // Disconnecting user was the talker (or floor was idle). Notify peer so their UI resets.
+                    this.sendDropCallToUser(this.id, details.targetId, 1, 0);
+                    States.clearUserPrivateCall(details.targetId);
+                  } else {
+                    logger.info(`handleConnectionClose: peer ${details.targetId} holds private floor —` +
+                                ` skipping DropCall, clearing only self ${this.id}`);
+                  }
+                  States.clearUserActiveCall(this.id);
+                  // Emit unregister AFTER sendEndCallToUser so the server's "message"
+                  // listener is still active when the EndCall event is dispatched.
+                  this.emit("unregister", this, activeGroups || []);
+                });
+                return;
+              }
             }
-          }
-          States.clearUserActiveCall(this.id);
-          // Emit unregister AFTER sendEndCallToUser so the server's "message"
-          // listener is still active when the EndCall event is dispatched.
-          this.emit("unregister", this, activeGroups || []);
-        });
+            States.clearUserActiveCall(this.id);
+            // Emit unregister AFTER sendEndCallToUser so the server's "message"
+            // listener is still active when the EndCall event is dispatched.
+            this.emit("unregister", this, activeGroups || []);
+          });
+        };
+
+        // Only remove from groups where the user does NOT hold the floor.
+        // If they hold the floor they are currently talking — removing them would end
+        // their transmission when a listener reconnects.
+        if (activeGroups && activeGroups.length > 0) {
+          const groupsToKeep: Array<number|string> = [];
+          let groupsChecked = 0;
+          activeGroups.forEach((groupId) => {
+            States.isFloorOwnerOfGroup(groupId, this.id, (floorErr, isOwner) => {
+              if (isOwner) {
+                logger.info(`handleConnectionClose: user ${this.id} holds group floor in ${groupId}` +
+                            ` — keeping as active participant, will clear on STOP`);
+                groupsToKeep.push(groupId);
+              }
+              groupsChecked++;
+              if (groupsChecked === activeGroups.length) {
+                // Remove from all groups, then re-add groups where user holds floor
+                States.removeActiveParticipantFromAllGroups(this.id, (removeErr) => {
+                  groupsToKeep.forEach((groupToKeep) => {
+                    States.addUserToActiveCallGroup(this.id, groupToKeep, false);
+                  });
+                  continueWithCloseHandling();
+                });
+              }
+            });
+          });
+        } else {
+          States.removeActiveParticipantFromAllGroups(this.id);
+          continueWithCloseHandling();
+        }
       });
     }
   }
