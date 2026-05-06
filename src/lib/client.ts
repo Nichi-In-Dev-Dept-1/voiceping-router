@@ -444,6 +444,16 @@ export default class Client extends EventEmitter {
             doTargetCheck();
             return;
           }
+          // Sender is in a group call but initiating a new private call — allow them to leave the group.
+          if (senderDetails.channelType === 2) {
+            logger.info(`handlePrivateStartMessage: sender ${msg.fromId} initiating new call to ${msg.toId}` +
+                        ` — leaving group ${senderDetails.targetId} to start private call`);
+            States.removeUserFromActiveCallGroup(msg.fromId, senderDetails.targetId, () => {
+              States.clearUserActiveCall(msg.fromId);
+              doTargetCheck();
+            });
+            return;
+          }
           // Group-type busy — reject immediately (floor check not applicable for group floors).
           logger.info(`handlePrivateStartMessage: sender ${msg.fromId} is busy with` +
                       ` ${senderDetails.targetId} — rejecting call to ${msg.toId}`);
@@ -1059,7 +1069,17 @@ export default class Client extends EventEmitter {
           States.clearUserActiveCall(senderId);
           meta.membersInCall = count;
           msg.messageId = JSON.stringify(meta);
-          callback();
+          // If this was the last participant, clean up the entire group state
+          // to prevent stale state when clients don't send CallEndedForAll
+          if (count === 0) {
+            logger.info(`handleTextMessage DropCall: last participant left group ${groupId}` +
+                        ` — cleaning up group call state`);
+            States.clearActiveCallGroup(groupId, () => {
+              callback();
+            });
+          } else {
+            callback();
+          }
         });
         return;
       case "CallEndedForAll":
