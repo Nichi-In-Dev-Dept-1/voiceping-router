@@ -76,8 +76,18 @@ export default class Client extends EventEmitter {
     States.releasePrivateFloorOwnershipForUser(this.id);
     States.clearUserActiveCall(this.id);
     if (stalePeer) {
-      logger.info(`registerSocket: clearing stale private call peer ${stalePeer} for reconnecting user ${this.id}`);
-      States.clearUserPrivateCall(stalePeer);
+      // Only clear the peer's call state if they are not the active floor owner.
+      // If the peer holds the floor they are currently talking — wiping their state would
+      // end their transmission when the listener reconnects.
+      States.isPrivateFloorOwner(stalePeer, this.id, stalePeer, (floorErr, peerIsOwner) => {
+        if (!peerIsOwner) {
+          logger.info(`registerSocket: clearing stale private call peer ${stalePeer} for reconnecting user ${this.id}`);
+          States.clearUserPrivateCall(stalePeer);
+        } else {
+          logger.info(`registerSocket: peer ${stalePeer} holds private floor —` +
+                      ` skipping stale clear for reconnecting user ${this.id}`);
+        }
+      });
     }
 
     this.isLoginDuplicated(deviceId, key, (err, data) => {
@@ -1590,10 +1600,24 @@ export default class Client extends EventEmitter {
             // unnecessary lookup noise and signals a ghost user that never existed.
             const targetIdStr = (details.targetId || "").toString().replace(/^0+$/, "0");
             if (details.targetId && targetIdStr !== "0" && targetIdStr !== "00000") {
-              // Notify the peer that this user disconnected so their UI resets and
-              // they stop transmitting audio to a now-dead socket.
-              this.sendDropCallToUser(this.id, details.targetId, 1, 0);
-              States.clearUserPrivateCall(details.targetId);
+              // releasePrivateFloorOwnershipForUser(this.id) already ran above, so if the
+              // peer still holds the floor they are the active talker. Skip DropCall to avoid
+              // cutting off a transmission in progress — let them finish and release PTT naturally.
+              States.isPrivateFloorOwner(this.id, details.targetId, details.targetId, (floorErr, peerIsOwner) => {
+                if (!peerIsOwner) {
+                  // Disconnecting user was the talker (or floor was idle). Notify peer so their UI resets.
+                  this.sendDropCallToUser(this.id, details.targetId, 1, 0);
+                  States.clearUserPrivateCall(details.targetId);
+                } else {
+                  logger.info(`handleConnectionClose: peer ${details.targetId} holds private floor —` +
+                              ` skipping DropCall, clearing only self ${this.id}`);
+                }
+                States.clearUserActiveCall(this.id);
+                // Emit unregister AFTER sendEndCallToUser so the server's "message"
+                // listener is still active when the EndCall event is dispatched.
+                this.emit("unregister", this, activeGroups || []);
+              });
+              return;
             }
           }
           States.clearUserActiveCall(this.id);
