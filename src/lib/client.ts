@@ -1055,6 +1055,8 @@ export default class Client extends EventEmitter {
         return;
       case "DropCall":
         States.removeUserFromActiveCallGroup(senderId, groupId, (err, count) => {
+          // Clear the user's active call state so they're no longer marked as busy with this group
+          States.clearUserActiveCall(senderId);
           meta.membersInCall = count;
           msg.messageId = JSON.stringify(meta);
           callback();
