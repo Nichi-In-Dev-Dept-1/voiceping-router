@@ -884,7 +884,16 @@ export default class States {
         // immediately after the SOS caller's first talk ends.
         // Fix: if the claimed owner holds no local floor key for this group, treat the
         // Redis key as stale, force-release it, and retry acquisition once.
-        if (ownerStr && ownerStr !== "0" && ownerStr !== userIdStr) {
+        if (ownerStr === userIdStr) {
+          // Reconnection / Duplicate START: User already owns the floor in Redis.
+          // Synchronize local tracking and proceed as if acquired.
+          if (!groupFloorKeysByUser[userIdStr]) { groupFloorKeysByUser[userIdStr] = new Set(); }
+          groupFloorKeysByUser[userIdStr].add(groupIdStr);
+          return States.setBusyStateOfGroup(groupIdStr, userIdStr, (setErr) => {
+            if (setErr) { return callback(setErr, false, userId); }
+            return callback(null, true, userId);
+          });
+        } else if (ownerStr && ownerStr !== "0") {
           const ownerHoldsLocalFloor = groupFloorKeysByUser[ownerStr] &&
             groupFloorKeysByUser[ownerStr].has(groupIdStr);
           if (!ownerHoldsLocalFloor) {
