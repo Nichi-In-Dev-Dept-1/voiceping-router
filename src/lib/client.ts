@@ -49,6 +49,8 @@ export default class Client extends EventEmitter {
   // completes (race condition on quick tap-and-release) can be buffered and replayed.
   private pendingGroupStart: Map<string, IMessage> = new Map();
   private pendingGroupStop: Map<string, IMessage> = new Map();
+  private pendingPrivateStart: Map<string, IMessage> = new Map();
+  private pendingPrivateStop: Map<string, IMessage> = new Map();
   private overlapMissedCallKeys: Set<string> = new Set();
   private overlapMissedCallKeyTimers: Map<string, NodeJS.Timer> = new Map();
 
@@ -331,6 +333,22 @@ export default class Client extends EventEmitter {
     const newCallIsSos = this.parseIsSosCall(msg);
     const newCallIsInterrupt = this.parseIsInterruptCall(msg);
 
+    // Register in-flight START so a quick-release STOP can be buffered (same pattern
+    // as pendingGroupStart/pendingGroupStop for GROUP calls).
+    const privateStartStopKey = `${msg.fromId}_${msg.toId}`;
+    if (this.pendingPrivateStart.has(privateStartStopKey)) {
+      this.pendingPrivateStop.delete(privateStartStopKey);
+    }
+    this.pendingPrivateStart.set(privateStartStopKey, msg);
+    setTimeout(() => {
+      if (this.pendingPrivateStart.has(privateStartStopKey)) {
+        logger.info(`handlePrivateStartMessage: TTL expiry — clearing stale pending START` +
+                    ` for ${msg.fromId}→${msg.toId}`);
+        this.pendingPrivateStart.delete(privateStartStopKey);
+        this.pendingPrivateStop.delete(privateStartStopKey);
+      }
+    }, 15000);
+
     // 1. Check if the SENDER is already in a different active call.
     States.getCallDetailsForUser(msg.fromId, (err1, senderDetails) => {
       if (err1) {
@@ -551,6 +569,18 @@ export default class Client extends EventEmitter {
       this.acknowledgePrivateStartMessage(msg);
       States.setCurrentMessageOfUser(msg.fromId, msg);
       this.emit("message", msg, this);
+
+      // Clear in-flight marker and replay any STOP that arrived before floor was ready.
+      // Delay 400 ms so the receiver processes START before STOP arrives (same as GROUP).
+      const privateKey = `${msg.fromId}_${msg.toId}`;
+      this.pendingPrivateStart.delete(privateKey);
+      const bufferedPrivateStop = this.pendingPrivateStop.get(privateKey);
+      if (bufferedPrivateStop) {
+        this.pendingPrivateStop.delete(privateKey);
+        logger.info(`proceedWithPrivateStart: processing buffered STOP for` +
+                    ` ${msg.fromId}→${msg.toId} (quick tap-and-release, 400ms delay)`);
+        setTimeout(() => this.finishStopMessage(bufferedPrivateStop), 400);
+      }
     });
   }
 
@@ -859,6 +889,16 @@ export default class Client extends EventEmitter {
         return;
       }
       if (!isOwner) {
+        // If a START for this user is still being processed (async floor acquisition),
+        // buffer this STOP so it gets replayed once START finishes — mirrors the
+        // pendingGroupStop buffer used for GROUP quick tap-and-release.
+        const privateKey = `${msg.fromId}_${msg.toId}`;
+        if (this.pendingPrivateStart.has(privateKey)) {
+          logger.info(`handleStopMessage: buffering STOP for private ${msg.fromId}→${msg.toId}` +
+                      ` — START still in-flight`);
+          this.pendingPrivateStop.set(privateKey, msg);
+          return;
+        }
         debug(`id ${this.id} ignoring STOP from non-owner ${msg.fromId} for private ${msg.toId}`);
         return;
       }
