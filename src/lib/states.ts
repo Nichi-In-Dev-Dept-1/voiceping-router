@@ -36,6 +36,7 @@ const userPrivateCallState: { [userId: string]: { peerId: string; isSos: boolean
 const privateFloorKeysByUser: { [userId: string]: Set<string> } = {};
 
 const groupSosState: { [groupId: string]: boolean } = {};
+const privateSosState: { [floorKey: string]: boolean } = {};
 
 // Tracks which group members actually received a START for the current floor session.
 // undefined  → no restriction (normal group call, broadcast to all)
@@ -398,8 +399,17 @@ export default class States {
   // ── Per-user active private call tracking (overlap-call detection) ──────────
 
   public static setUserPrivateCall(userId: numberOrString, peerId: numberOrString, isSos: boolean) {
-    userPrivateCallState[userId + ""] = { peerId: peerId + "", isSos };
-    Redis.setActiveCall(userId, 1, peerId, isSos);
+    const floorKey = privateFloorKey(userId, peerId);
+    if (isSos) {
+      privateSosState[floorKey] = true;
+    }
+    // Never downgrade isSos from true to false within the same call session.
+    // The receiver's PTT turn sends isSosCall=false (the app strips it to avoid
+    // re-triggering SOS preemption on the router), but the private call must remain
+    // flagged as SOS for overlap-detection — mirrors how groupSosState works.
+    const effectiveIsSos = isSos || !!privateSosState[floorKey];
+    userPrivateCallState[userId + ""] = { peerId: peerId + "", isSos: effectiveIsSos };
+    Redis.setActiveCall(userId, 1, peerId, effectiveIsSos);
   }
 
   public static setUserGroupCallState(userId: numberOrString, groupId: numberOrString, isSos: boolean) {
@@ -416,6 +426,11 @@ export default class States {
   }
 
   public static clearUserPrivateCall(userId: numberOrString) {
+    const peerId = States.getPrivateCallPeer(userId);
+    if (peerId) {
+      const floorKey = privateFloorKey(userId, peerId);
+      delete privateSosState[floorKey];
+    }
     delete userPrivateCallState[userId + ""];
     Redis.clearActiveCall(userId);
   }

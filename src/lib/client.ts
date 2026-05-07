@@ -89,10 +89,12 @@ export default class Client extends EventEmitter {
             }
             groupsChecked++;
             if (groupsChecked === activeGroups.length) {
-              // Remove from all groups, then re-add groups where user holds floor
+              // Remove from all groups, then re-add groups where user holds floor.
+              // Preserve the SOS flag from groupSosState so a reconnecting SOS caller
+              // doesn't appear as isSos=false and get overridden by a second SOS.
               States.removeActiveParticipantFromAllGroups(this.id, (removeErr) => {
                 groupsToKeep.forEach((groupToKeep) => {
-                  States.addUserToActiveCallGroup(this.id, groupToKeep, false);
+                  States.addUserToActiveCallGroup(this.id, groupToKeep, States.isGroupSos(groupToKeep));
                 });
               });
             }
@@ -412,9 +414,14 @@ export default class Client extends EventEmitter {
               return;
             }
 
-            if ((!newCallIsSos && !newCallIsInterrupt) || targetDetails.isSos) {
+            // targetDetails.isSos can be stale if the user reconnected mid-SOS (isSos was
+            // reset to false in reconnect handling). Use groupSosState as the authoritative
+            // fallback so a private SOS can't eject a member from a group SOS call.
+            const targetGroupInSos = targetDetails.isSos ||
+              (targetDetails.channelType === 2 && States.isGroupSos(targetDetails.targetId));
+            if ((!newCallIsSos && !newCallIsInterrupt) || targetGroupInSos) {
               // Reject: normal→any or sos→sos or interrupt→sos
-              logger.info(`handlePrivateStartMessage: target ${msg.toId} busy (existingSos=${targetDetails.isSos}` +
+              logger.info(`handlePrivateStartMessage: target ${msg.toId} busy (existingSos=${targetGroupInSos}` +
                           ` newSos=${newCallIsSos} newInterrupt=${newCallIsInterrupt}) — rejecting ${msg.fromId}`);
               this.sendOverlapMissedCallText(msg, msg.toId);
               this.message({
@@ -428,7 +435,7 @@ export default class Client extends EventEmitter {
               return;
             }
 
-            // SOS overrides a normal call: end the target's existing call first.
+            // SOS overrides a non-SOS group call: end the target's existing call first.
             logger.info(`handlePrivateStartMessage: SOS override — ending existing call for ${msg.toId}`);
             this.executeCallOverrideForUser(msg.toId, targetDetails, () => {
               this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt);
@@ -1382,12 +1389,17 @@ export default class Client extends EventEmitter {
           } else if (details.channelType === 2 && details.targetId === msg.toId.toString()) {
             // Already in this same group call — include them.
             availableRecipients.push(uid);
-            if (isSos && !details.isSos) {
+            // Override only if the existing call is genuinely non-SOS. details.isSos can be
+            // stale (e.g. reset to false on reconnect) so also check groupSosState directly.
+            const memberGroupInSos = details.isSos || States.isGroupSos(details.targetId);
+            if (isSos && !memberGroupInSos) {
               // SOS overrides a normal call even in the same group to ensure UI visibility.
               overrides.push((done) => this.executeCallOverrideForUser(uid, details, done));
             }
-          } else if (isSos && !details.isSos) {
-            // SOS overrides a normal call in a different channel.
+          } else if (isSos && !details.isSos && !States.isGroupSos(details.targetId)) {
+            // SOS overrides a non-SOS call in a different channel.
+            // Guard: also check groupSosState in case details.isSos is stale — don't eject
+            // a member from an SOS group call just because their per-user flag is stale.
             availableRecipients.push(uid);
             overrides.push((done) => this.executeCallOverrideForUser(uid, details, done));
           } else {
@@ -1732,10 +1744,12 @@ export default class Client extends EventEmitter {
               }
               groupsChecked++;
               if (groupsChecked === activeGroups.length) {
-                // Remove from all groups, then re-add groups where user holds floor
+                // Remove from all groups, then re-add groups where user holds floor.
+                // Preserve the SOS flag from groupSosState so a disconnecting SOS caller
+                // doesn't appear as isSos=false and get overridden by a second SOS.
                 States.removeActiveParticipantFromAllGroups(this.id, (removeErr) => {
                   groupsToKeep.forEach((groupToKeep) => {
-                    States.addUserToActiveCallGroup(this.id, groupToKeep, false);
+                    States.addUserToActiveCallGroup(this.id, groupToKeep, States.isGroupSos(groupToKeep));
                   });
                   continueWithCloseHandling();
                 });
