@@ -68,6 +68,16 @@ export default class Client extends EventEmitter {
     connection.addListener("pong", this.handleConnectionPong);
     this.connections[key] = connection;
 
+    // Clear stale pending operations from the previous session. After a WiFi
+    // drop-and-reconnect the Client object is reused and these maps may still
+    // hold a STOP from the old session. If a new START arrives while the floor
+    // is being acquired (async) the stale STOP gets buffered and replays 400ms
+    // later, immediately killing the new call.
+    this.pendingPrivateStart.clear();
+    this.pendingPrivateStop.clear();
+    this.pendingGroupStart.clear();
+    this.pendingGroupStop.clear();
+
     // Clear user state on new connection to prevent stale busy/floor ownership states.
     // IMPORTANT: capture the private-call peer BEFORE wiping in-memory state so we can
     // also clear the peer's side.  Reading peer AFTER clearUserActiveCall would find
