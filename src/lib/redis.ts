@@ -336,6 +336,26 @@ class Redis {
     });
   }
 
+  public static removeUserFromAllGroups(
+    userId: numberOrString,
+    callback: (err: Error, succeed: boolean) => void) {
+
+    Redis.getGroupsOfUser(userId, (err, groupIds) => {
+      if (err) { return callback(err, null); }
+      if (!groupIds || groupIds.length === 0) { return callback(null, true); }
+
+      const multi = client.multi();
+      multi.del(Keys.forGroupsOfUser(userId));
+      groupIds.forEach((groupId) => {
+        multi.srem(Keys.forUsersInsideGroup(groupId), userId);
+      });
+      multi.exec(function(transactionErr, replies) {
+        if (transactionErr) { return callback(transactionErr, null); }
+        return callback(null, !!replies);
+      });
+    });
+  }
+
   public static addMessageToGroup(messageId: string, groupId: numberOrString,
                                   callback: (err: Error, succeed: boolean) => void) {
     const multi = client.multi();

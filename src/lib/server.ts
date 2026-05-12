@@ -8,6 +8,7 @@ import * as WebSocket from "ws";
 import ChannelType = require("./channeltype");
 import Client, { IClients } from "./client";
 import config = require("./config");
+import Distributed = require("./distributed");
 
 import logger = require("./logger");
 import MessageType = require("./messagetype");
@@ -44,6 +45,8 @@ class Server implements IServer {
   private clients: IClients = {};
   private sockets = {};
   private deviceTokens = {};
+  private instanceHeartbeat: NodeJS.Timer = null;
+  private instanceId: string = config.instance.id;
   private wss = null;
   private verify = null;
 
@@ -93,6 +96,9 @@ class Server implements IServer {
       // immediately (their in-memory state is already fresh after restart).
       attachConnectionHandler();
     }
+
+    Distributed.subscribeToInstance(this.instanceId, this.handleDistributedUserMessage);
+    this.periodicRefreshUserInstances();
   }
 
   // IServer Implementation
@@ -105,16 +111,7 @@ class Server implements IServer {
     const dest = deliveryId || msg.toId;
     const persistAndSend = (enrichedMsg: IMessage) => {
       packer.pack(enrichedMsg, (err, packed) => {
-        const client = this.clients[dest];
-        if (!client) {
-          if (msg.messageType === MessageType.AUDIO) {
-            debug(`sendMessageToUser type AUDIO NOT-FOUND id ${dest} ${JSON.stringify(msg)}`);
-          } else {
-            debug(`sendMessageToUser type NON-AUDIO NOT-FOUND id ${dest} ${JSON.stringify(msg)}`);
-          }
-          return;
-        }
-        client.send(packed);
+        this.sendPackedDataToUser(packed, dest, msg);
       });
     };
 
@@ -142,7 +139,7 @@ class Server implements IServer {
   public sendMessageToGroup(this: Server, msg: IMessage) {
     this.applyAuthoritativeGroupMeta(msg, () => {
       this.prepareGroupMessage(msg, (packed) => {
-        this.sendDataFromUserToGroup(packed, msg.fromId, msg.toId, this.shouldEchoToSender(msg));
+        this.sendDataFromUserToGroup(packed, msg.fromId, msg.toId, this.shouldEchoToSender(msg), msg);
       });
     });
   }
@@ -150,7 +147,7 @@ class Server implements IServer {
   public sendMessageToGroupSubset(this: Server, msg: IMessage, recipientIds: numberOrString[]) {
     this.applyAuthoritativeGroupMeta(msg, () => {
       this.prepareGroupMessage(msg, (packed) => {
-        this.sendDataFromUserToSubset(packed, msg.fromId, recipientIds, this.shouldEchoToSender(msg));
+        this.sendDataFromUserToSubset(packed, msg.fromId, recipientIds, this.shouldEchoToSender(msg), msg);
       });
     });
   }
@@ -262,6 +259,13 @@ class Server implements IServer {
     client.removeListener("unregister", this.handleClientUnregister);
     delete this.clients[clientId];
     delete this.sockets[clientId];
+    Distributed.clearUserInstance(clientId, this.instanceId, (err, cleared) => {
+      if (err) {
+        logger.error(`Distributed.clearUserInstance id ${clientId} instance ${this.instanceId} ERR ${err}`);
+      } else if (cleared) {
+        debug(`Distributed.clearUserInstance id ${clientId} instance ${this.instanceId}`);
+      }
+    });
     logger.info(`UNREGISTERED id ${clientId} clients ${Object.keys(this.clients).length}` +
                 ` sockets ${Object.keys(this.sockets).length} wss ${this.wss.clients.size}`);
   }
@@ -271,6 +275,8 @@ class Server implements IServer {
     if (msg.channelType === ChannelType.GROUP) {
       if (msg.messageType === MessageType.CONNECTION) {
         this.handleConnectionMessage(msg);
+      } else if (msg.messageType === MessageType.USER_REMOVE_ALL) {
+        this.removeFromAllGroups(msg.fromId);
       } else {
         this.sendMessageToGroup(msg);
       }
@@ -291,6 +297,7 @@ class Server implements IServer {
 
     client.registerSocket(socket, key, deviceId);
     this.sockets[id] = socket;
+    this.refreshUserInstance(id);
 
     if (user && user.channelIds instanceof Array) {
       // Seed in-memory membership immediately (synchronous) so that PTT START
@@ -524,13 +531,12 @@ class Server implements IServer {
    * @private
    *
    */
-  private sendDataToUser(this: Server, data: Buffer, userId: numberOrString) {
-    if (this.clients.hasOwnProperty(userId)) {
-      const client = this.clients[userId];
-      client.send(data);
-    } else {
-      // debug(`sendDataToUser NOT-FOUND id ${userId}`);
-    }
+  private sendDataToUser(this: Server, data: Buffer, userId: numberOrString): boolean {
+    if (!this.clients.hasOwnProperty(userId)) { return false; }
+
+    const client = this.clients[userId];
+    client.send(data);
+    return true;
   }
 
   /**
@@ -545,7 +551,8 @@ class Server implements IServer {
   private sendDataFromUserToGroup(
     this: Server,
     data: Buffer, userId: numberOrString,
-    groupId: numberOrString, echo: boolean = false
+    groupId: numberOrString, echo: boolean = false,
+    msg?: IMessage
   ) {
     States.getUsersInsideGroup(groupId, (err, userIds) => {
       if (err) {
@@ -556,19 +563,123 @@ class Server implements IServer {
         logger.info(`States.getUsersInsideGroup EMPTY id ${userId} groupId ${groupId}`);
         return;
       }
-      this.sendDataFromUserToSubset(data, userId, userIds, echo);
+      this.sendDataFromUserToSubset(data, userId, userIds, echo, msg);
     });
   }
 
   private sendDataFromUserToSubset(
     this: Server,
     data: Buffer, userId: numberOrString,
-    recipientIds: numberOrString[], echo: boolean = false
+    recipientIds: numberOrString[], echo: boolean = false,
+    msg?: IMessage
   ) {
     for (const recipientId of recipientIds) {
       if (!echo && recipientId.toString() === userId.toString()) { continue; }
-      this.sendDataToUser(data, recipientId);
+      this.sendPackedDataToUser(data, recipientId, msg);
     }
+  }
+
+  private sendPackedDataToUser(this: Server, data: Buffer, userId: numberOrString, msg?: IMessage) {
+    if (this.sendDataToUser(data, userId)) { return; }
+
+    if (msg) {
+      this.routeMessageToRemoteUser(userId, msg);
+      return;
+    }
+
+    debug(`sendPackedDataToUser NOT-FOUND id ${userId}`);
+  }
+
+  private routeMessageToRemoteUser(this: Server, userId: numberOrString, msg: IMessage) {
+    Distributed.getUserInstance(userId, (err, instanceId) => {
+      if (err) {
+        logger.error(`Distributed.getUserInstance id ${userId} ERR ${err}`);
+        return;
+      }
+
+      if (!instanceId) {
+        if (msg.messageType === MessageType.AUDIO) {
+          debug(`sendMessageToUser type AUDIO NOT-FOUND id ${userId} ${JSON.stringify(msg)}`);
+        } else {
+          debug(`sendMessageToUser type NON-AUDIO NOT-FOUND id ${userId} ${JSON.stringify(msg)}`);
+        }
+        return;
+      }
+
+      if (instanceId === this.instanceId) {
+        debug(`Distributed.getUserInstance id ${userId} instance ${instanceId} local-instance-no-client`);
+        return;
+      }
+
+      Distributed.publishMessageToInstance(instanceId, userId, msg, (publishErr, receivers) => {
+        if (publishErr) {
+          logger.error(`Distributed.publishMessageToInstance user ${userId} instance ${instanceId} ERR ${publishErr}`);
+          return;
+        }
+
+        debug(`Distributed.publishMessageToInstance user ${userId} instance ${instanceId} receivers ${receivers}`);
+      });
+    });
+  }
+
+  private handleDistributedUserMessage = (userId: numberOrString, msg: IMessage) => {
+    packer.pack(msg, (err, packed) => {
+      if (err) {
+        logger.error(`handleDistributedUserMessage pack ERR ${err}`);
+        return;
+      }
+
+      if (!this.sendDataToUser(packed, userId)) {
+        debug(`handleDistributedUserMessage NOT-FOUND id ${userId} ${JSON.stringify(msg)}`);
+      }
+    });
+  }
+
+  private refreshUserInstance(this: Server, userId: numberOrString) {
+    Distributed.setUserInstance(userId, this.instanceId, (err, succeed) => {
+      if (err) {
+        logger.error(`Distributed.setUserInstance id ${userId} instance ${this.instanceId} ERR ${err}`);
+      } else if (!succeed) {
+        debug(`Distributed.setUserInstance id ${userId} instance ${this.instanceId} failed`);
+      }
+    });
+  }
+
+  private periodicRefreshUserInstances(this: Server) {
+    if (this.instanceHeartbeat || config.instance.heartbeatInterval <= 0) { return; }
+
+    this.instanceHeartbeat = setInterval(() => {
+      Object.keys(this.clients).forEach((clientId) => {
+        this.refreshUserInstance(clientId);
+      });
+    }, config.instance.heartbeatInterval);
+  }
+
+  private removeFromAllGroups(this: Server, userId: numberOrString): void {
+    Redis.getGroupsOfUser(userId, (err, groupIds) => {
+      if (err) {
+        logger.error(`Redis.getGroupsOfUser id ${userId} ERR ${err}`);
+        return;
+      }
+
+      const groups = groupIds || [];
+      Redis.removeUserFromAllGroups(userId, (removeErr) => {
+        if (removeErr) {
+          logger.error(`Redis.removeUserFromAllGroups id ${userId} ERR ${removeErr}`);
+          return;
+        }
+
+        groups.forEach((groupId) => {
+          Redis.getUsersInsideGroup(groupId, (groupErr, userIds) => {
+            if (groupErr) {
+              logger.error(`Redis.getUsersInsideGroup groupId ${groupId} ERR ${groupErr}`);
+              return;
+            }
+            States.setUsersInsideGroup(groupId, userIds);
+          });
+        });
+      });
+    });
   }
 
   /**

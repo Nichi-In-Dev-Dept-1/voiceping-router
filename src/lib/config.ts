@@ -7,6 +7,11 @@ const config = {
     inspectInterval: Number(process.env.GROUP_INSPECT_INTERVAL) || (60 * 1000)
   },
   heartbeatCloseGracePeriod: Number(process.env.HEARTBEAT_CLOSE_GRACE_PERIOD) || (5 * 1000),
+  instance: {
+    heartbeatInterval: Number(process.env.INSTANCE_HEARTBEAT_INTERVAL) || (60 * 1000),
+    id: process.env.INSTANCE_ID || process.env.HOSTNAME || ("voiceping-router-" + process.pid),
+    presenceTtl: Number(process.env.INSTANCE_PRESENCE_TTL) || (5 * 60)
+  },
   message: {
     maximumDuration: Number(process.env.MAXIMUM_AUDIO_DURATION) || (90 * 1000),
     maximumIdleDuration: Number(process.env.MAXIMUM_IDLE_DURATION) || (12 * 1000)
