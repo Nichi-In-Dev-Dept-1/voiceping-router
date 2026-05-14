@@ -169,6 +169,20 @@ export default class Client extends EventEmitter {
     });
   }
 
+  // True iff this Client has at least one Connection whose underlying socket
+  // is in WebSocket.OPEN state. Used by Server.isUserLive to distinguish a
+  // genuinely connected user from one whose Client record is still around but
+  // every transport has died — important for short-circuiting stale BUSY
+  // rejections when the target's previous call wasn't torn down cleanly.
+  public hasLiveConnection(this: Client): boolean {
+    const keys = Object.keys(this.connections);
+    for (const k of keys) {
+      const conn = this.connections[k];
+      if (conn && conn.isOpen()) { return true; }
+    }
+    return false;
+  }
+
   public message(this: Client, message: IMessage, key0?: string) {
     Object.keys(this.connections).forEach((key) => {
       if (key0 && key0 === key) { return; }
@@ -394,6 +408,36 @@ export default class Client extends EventEmitter {
                           ` target ${msg.toId} (was linked to disconnected peer ${targetDetails.targetId})`);
               States.clearUserPrivateCall(msg.toId);
               States.clearUserPrivateCall(targetDetails.targetId);
+              this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt);
+              return;
+            }
+
+            // Target itself has no live socket — its busy state is definitively
+            // stale (you cannot be in a call without an OPEN transport).
+            // Happens when a previous call ended uncleanly (force-kill, hard
+            // network loss, router restart) and the Redis u.{target}.ac key is
+            // still alive within its ~125s TTL. Clear and accept the call;
+            // existing dedupe handles any in-flight stray STOP as a no-op.
+            //
+            // Carve-out: if the incoming call is SOS or warikomi AND the
+            // stale-state's peer is still connected, defer to the existing
+            // SOS/interrupt override path below so the peer receives the
+            // CallEndedForAll / override notification (preserves SOS contract
+            // for the connected peer rather than silently dropping its state).
+            const peerStillConnected = targetDetails.channelType !== 2 &&
+              this.server.isUserConnected(targetDetails.targetId);
+            const deferToOverridePath = (newCallIsSos || newCallIsInterrupt) && peerStillConnected;
+            if (!this.server.isUserLive(msg.toId) && !deferToOverridePath) {
+              logger.info(`handlePrivateStartMessage: clearing stale call state for target ${msg.toId}` +
+                          ` — target has no live socket (channelType=${targetDetails.channelType},` +
+                          ` peer=${targetDetails.targetId})`);
+              if (targetDetails.channelType === 1) {
+                States.clearUserPrivateCall(msg.toId);
+                States.clearUserPrivateCall(targetDetails.targetId);
+              } else {
+                States.removeActiveParticipantFromAllGroups(msg.toId);
+                States.clearUserActiveCall(msg.toId);
+              }
               this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt);
               return;
             }

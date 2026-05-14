@@ -21,7 +21,9 @@ export default class Connection extends EventEmitter {
 
   private clientId: numberOrString;
   private heartbeatCloseTimer: NodeJS.Timer;
+  private pongTimer: NodeJS.Timer;
   private socket: WebSocket;
+  private terminated: boolean = false;
   private timestamp: number;
 
   constructor(key: string, socket: WebSocket, deviceId: string, clientId: numberOrString) {
@@ -33,6 +35,21 @@ export default class Connection extends EventEmitter {
     this.socket = socket;
     this.timestamp = Date.now();
 
+    // Enable TCP keepalive on the raw socket so the kernel surfaces a dead
+    // peer (NAT eviction / cellular handoff / firewall RST) within tens of
+    // seconds even if the application ping is somehow delayed. Defence in
+    // depth alongside the pong-timeout logic below.
+    const rawSocket = (socket as any)._socket;
+    if (rawSocket && typeof rawSocket.setKeepAlive === "function") {
+      try {
+        rawSocket.setKeepAlive(true, config.tcpKeepAliveDelay);
+      } catch (exception) {
+        debug(`id ${this.clientId} key ${this.key}` +
+              ` setKeepAlive ERR ${JSON.stringify(exception)}` +
+              ` device ${this.deviceId}`);
+      }
+    }
+
     socket.addListener("close", this.handleSocketClose);
     socket.addListener("error", this.handleSocketError);
     socket.addListener("message", this.handleSocketMessage);
@@ -41,19 +58,30 @@ export default class Connection extends EventEmitter {
   }
 
   public ping(this: Connection) {
-    if (this.socket.readyState === WebSocket.OPEN) {
-      try {
-        this.socket.ping("voiceping:" + this.clientId, false);
-      } catch (exception) {
-        debug(`id ${this.clientId} key ${this.key}` +
-              ` PING ERR ${JSON.stringify(exception)}` +
-              ` device ${this.deviceId}`);
-      }
+    if (this.socket.readyState !== WebSocket.OPEN) { return; }
+    try {
+      this.socket.ping("voiceping:" + this.clientId, false);
+    } catch (exception) {
+      debug(`id ${this.clientId} key ${this.key}` +
+            ` PING ERR ${JSON.stringify(exception)}` +
+            ` device ${this.deviceId}`);
+      return;
     }
+
+    // Start (or refresh) a deadline for the matching pong. Any inbound frame
+    // — pong, message, or client-initiated ping — clears it. If nothing
+    // arrives in time the socket is treated as dead and terminated, which
+    // emits "close" and propagates cleanup to Client/Server, removing the
+    // stale entry from this.clients[userId] within ~pingInterval+pongTimeout.
+    this.armPongTimer();
   }
 
   public getLastSeenAt(this: Connection) {
     return this.timestamp;
+  }
+
+  public isOpen(this: Connection) {
+    return this.socket.readyState === WebSocket.OPEN;
   }
 
   public terminate(this: Connection) {
@@ -98,14 +126,35 @@ export default class Connection extends EventEmitter {
     if (msg && (msg.messageType === MessageType.LOGIN_DUPLICATED || msg.messageType === MessageType.CONNECTION_ACK)) {
       debug(`id ${this.clientId} SEND readyState: ${this.socket.readyState}, msg: ${JSON.stringify(msg)}`);
     }
-    if (this.socket.readyState === WebSocket.OPEN) {
-        try {
-          this.socket.send(data);
-        } catch (exception) {
-          debug(`id ${this.clientId} key ${this.key}` +
-                ` SEND ERR ${JSON.stringify(exception)}` +
-                ` device ${this.deviceId}`);
-        }
+    if (this.socket.readyState !== WebSocket.OPEN) {
+      // Server believes this connection is still routable (it is in
+      // Client.connections), but the socket has already moved out of OPEN.
+      // Make the silent drop visible so the "calls not received" symptom
+      // can be diagnosed in production.
+      logger.info(`id ${this.clientId} key ${this.key} SEND_SKIPPED readyState ${this.socket.readyState}` +
+                  ` messageType ${msg ? msg.messageType : "?"} device ${this.deviceId}`);
+      return;
+    }
+    try {
+      this.socket.send(data, (err) => {
+        if (!err) { return; }
+        logger.error(`id ${this.clientId} key ${this.key} SEND_FAILED ${err.message || err}` +
+                     ` messageType ${msg ? msg.messageType : "?"} device ${this.deviceId}`);
+        // Write failure on an OPEN socket means the underlying transport is
+        // dead. Schedule termination on the next tick so we don't re-enter
+        // the ws event loop synchronously; handleSocketClose will then
+        // propagate cleanup through Client/Server.
+        if (this.terminated) { return; }
+        this.terminated = true;
+        setImmediate(() => this.terminate());
+      });
+    } catch (exception) {
+      logger.error(`id ${this.clientId} key ${this.key}` +
+                   ` SEND ERR ${JSON.stringify(exception)} device ${this.deviceId}`);
+      if (!this.terminated) {
+        this.terminated = true;
+        setImmediate(() => this.terminate());
+      }
     }
   }
 
@@ -135,6 +184,7 @@ export default class Connection extends EventEmitter {
           ` device ${this.deviceId}`);
 
     this.clearHeartbeatCloseTimer();
+    this.clearPongTimer();
 
     this.socket.removeListener("close", this.handleSocketClose);
     this.socket.removeListener("error", this.handleSocketError);
@@ -153,6 +203,8 @@ export default class Connection extends EventEmitter {
 
   private handleSocketMessage = (data: Buffer) => {
     this.timestamp = Date.now();
+    // Any inbound frame proves liveness — clear the pending pong deadline.
+    this.clearPongTimer();
     debug(`*************************************`);
     debug(`id ${this.clientId} key ${this.key}` +
               ` handleSocketMessage RAW data: ${data.toString()}` +
@@ -176,6 +228,7 @@ export default class Connection extends EventEmitter {
 
   private handleSocketPing = (data: Buffer) => {
     this.timestamp = Date.now();
+    this.clearPongTimer();
     let payload;
     if (data instanceof Buffer) { payload = data.toString(); }
     debug(`id ${this.clientId} key ${this.key}` +
@@ -185,6 +238,7 @@ export default class Connection extends EventEmitter {
 
   private handleSocketPong = (data: Buffer) => {
     this.timestamp = Date.now();
+    this.clearPongTimer();
     let payload;
     if (data instanceof Buffer) { payload = data.toString(); }
     debug(`id ${this.clientId} key ${this.key}` +
@@ -197,5 +251,27 @@ export default class Connection extends EventEmitter {
     if (!this.heartbeatCloseTimer) { return; }
     clearTimeout(this.heartbeatCloseTimer);
     this.heartbeatCloseTimer = null;
+  }
+
+  private armPongTimer(this: Connection) {
+    this.clearPongTimer();
+    if (!config.pongTimeout || config.pongTimeout <= 0) { return; }
+    this.pongTimer = setTimeout(() => {
+      this.pongTimer = null;
+      if (this.terminated) { return; }
+      const idleTime = Date.now() - this.timestamp;
+      logger.info(
+        `id: ${this.clientId} key: ${this.key} PONG_TIMEOUT` +
+        ` idleTime: ${idleTime} readyState: ${this.socket.readyState}`
+      );
+      this.terminated = true;
+      this.terminate();
+    }, config.pongTimeout);
+  }
+
+  private clearPongTimer(this: Connection) {
+    if (!this.pongTimer) { return; }
+    clearTimeout(this.pongTimer);
+    this.pongTimer = null;
   }
 }

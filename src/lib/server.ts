@@ -31,6 +31,7 @@ export interface IServer {
   sendMessageToGroup: (message: IMessage) => void;
   sendMessageToGroupSubset: (message: IMessage, recipientIds: numberOrString[]) => void;
   isUserConnected: (userId: numberOrString) => boolean;
+  isUserLive: (userId: numberOrString) => boolean;
 }
 interface IConnection {
   token: string;
@@ -105,6 +106,16 @@ class Server implements IServer {
 
   public isUserConnected(this: Server, userId: numberOrString): boolean {
     return this.clients.hasOwnProperty(userId + "");
+  }
+
+  // Stricter than isUserConnected: requires the Client to also have at least
+  // one Connection whose socket is in WebSocket.OPEN state. Used at private
+  // START time to short-circuit BUSY rejections when the target's busy state
+  // is stale (e.g. previous call ended without a clean STOP).
+  public isUserLive(this: Server, userId: numberOrString): boolean {
+    const client = this.clients[userId + ""];
+    if (!client) { return false; }
+    return client.hasLiveConnection();
   }
 
   public sendMessageToUser(this: Server, msg: IMessage, deliveryId?: numberOrString) {
