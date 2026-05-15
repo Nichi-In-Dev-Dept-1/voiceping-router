@@ -847,8 +847,10 @@ export default class Client extends EventEmitter {
     }
   }
 
-  /** Sends an OfflineMembers TEXT to the group-call caller with the list of PTT
-   *  numbers that were not connected. Caller uses this list to send wake-up pushes. */
+  /**
+   * Sends an OfflineMembers TEXT to the group-call caller with the list of PTT
+   * numbers that were not connected. Caller uses this list to send wake-up pushes.
+   */
   private sendOfflineMembersText(
     this: Client,
     msg: IMessage,
