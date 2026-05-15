@@ -359,13 +359,15 @@ export default class Client extends EventEmitter {
     const newCallIsSos = this.parseIsSosCall(msg);
     const newCallIsInterrupt = this.parseIsInterruptCall(msg);
 
-    // OFFLINE check: target has no client record at all (app killed, Doze, lost
-    // connection without reconnect). Distinguish from BUSY so the caller can send
-    // a wake-up push instead of just showing "busy". SOS/interrupt skip this
-    // because their override paths handle stale state via isUserLive below.
-    if (!newCallIsSos && !newCallIsInterrupt && !this.server.isUserConnected(msg.toId)) {
+    // OFFLINE check: target has no LIVE socket (isUserLive requires at least one
+    // socket in WebSocket.OPEN state). Covers app killed / force-stopped / Doze /
+    // lost connection where the Client record may still be in clients[] for a few
+    // seconds before TCP close or ping-timeout propagates. Using isUserConnected
+    // here would miss these cases and surface as "Busy" instead of "Offline".
+    // SOS/interrupt skip this so their override paths handle stale state below.
+    if (!newCallIsSos && !newCallIsInterrupt && !this.server.isUserLive(msg.toId)) {
       logger.info(`handlePrivateStartMessage: target ${msg.toId} OFFLINE` +
-                  ` — rejecting ${msg.fromId} with Offline so caller can wake via push`);
+                  ` (no live socket) — rejecting ${msg.fromId} with Offline so caller can wake via push`);
       this.message({
         channelType: msg.channelType, fromId: msg.fromId,
         messageType: MessageType.START_FAILED, payload: "Offline", toId: msg.toId
@@ -1474,10 +1476,12 @@ export default class Client extends EventEmitter {
         results.forEach((res: any) => {
           if (!res) { return; }
           const { uid, details } = res;
-          // OFFLINE: member has no client record (app killed, Doze, lost socket).
+          // OFFLINE: member has no LIVE socket (isUserLive requires WebSocket.OPEN).
+          // Catches app killed / force-stopped / Doze / lost connection even when the
+          // Client record is still in clients[] briefly before TCP close propagates.
           // Collected so the caller can wake them via push instead of silently dropping
           // them from the floor recipient list. Existing online members still get the call.
-          if (!this.server.isUserConnected(uid)) {
+          if (!this.server.isUserLive(uid)) {
             offlineRecipients.push(uid);
             return;
           }
