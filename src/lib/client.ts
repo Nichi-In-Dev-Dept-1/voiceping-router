@@ -849,6 +849,43 @@ export default class Client extends EventEmitter {
     }
   }
 
+  /** Sends a BusyMembers TEXT to the group-call caller with the list of members
+   *  the router rejected as "busy" (typically because their Redis state shows them
+   *  in another call). Caller pushes them — if the busy state is stale, the
+   *  receiver's wake handler force-reconnects, registerSocket clears the stale
+   *  active-call entry, and the next group START reaches them. If the receiver is
+   *  genuinely busy, the wake handler no-ops.
+   */
+  private sendBusyMembersText(
+    this: Client,
+    msg: IMessage,
+    busyPttNos: numberOrString[]
+  ): void {
+    const pttNos = busyPttNos.map((id) => id + "");
+    const busyMembersMsg = {
+      channelType: msg.channelType,
+      fromId: msg.toId,
+      messageId: JSON.stringify({
+        busyPttNos: pttNos,
+        callId: msg.toId.toString(),
+        errorType: "Busy",
+        lang: "",
+        membersInCall: 0,
+        textMessageType: "BusyMembers",
+        translate: false
+      }),
+      messageType: MessageType.TEXT,
+      payload: JSON.stringify({
+        message_id: "BusyMembers",
+        text: JSON.stringify({ callId: msg.toId.toString(), busyPttNos: pttNos })
+      }),
+      toId: msg.fromId
+    };
+    logger.info(`sendBusyMembersText: notifying caller ${msg.fromId}` +
+                ` group ${msg.toId} busyCount=${pttNos.length}`);
+    this.server.sendMessageToUser(busyMembersMsg, msg.fromId);
+  }
+
   /**
    * Sends an OfflineMembers TEXT to the group-call caller with the list of PTT
    * numbers that were not connected. Caller uses this list to send wake-up pushes.
@@ -1591,6 +1628,12 @@ export default class Client extends EventEmitter {
               // for the caller's next PTT once they wake up and re-register.
               if (offlineRecipients.length > 0) {
                 this.sendOfflineMembersText(msg, offlineRecipients);
+              }
+              // Same idea for busy-rejected members. If the busy state was stale, the
+              // receiver's wake handler will force-reconnect and clear it. If it was
+              // genuine, the wake handler no-ops. Either way the caller gets the chance.
+              if (overlapMissedRecipients.length > 0) {
+                this.sendBusyMembersText(msg, overlapMissedRecipients);
               }
 
               // Process a buffered STOP so quick tap-and-release always sends START then STOP.
