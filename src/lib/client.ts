@@ -359,6 +359,21 @@ export default class Client extends EventEmitter {
     const newCallIsSos = this.parseIsSosCall(msg);
     const newCallIsInterrupt = this.parseIsInterruptCall(msg);
 
+    // OFFLINE check: target has no client record at all (app killed, Doze, lost
+    // connection without reconnect). Distinguish from BUSY so the caller can send
+    // a wake-up push instead of just showing "busy". SOS/interrupt skip this
+    // because their override paths handle stale state via isUserLive below.
+    if (!newCallIsSos && !newCallIsInterrupt && !this.server.isUserConnected(msg.toId)) {
+      logger.info(`handlePrivateStartMessage: target ${msg.toId} OFFLINE` +
+                  ` — rejecting ${msg.fromId} with Offline so caller can wake via push`);
+      this.message({
+        channelType: msg.channelType, fromId: msg.fromId,
+        messageType: MessageType.START_FAILED, payload: "Offline", toId: msg.toId
+      });
+      this.sendBusyEventText(msg, "Offline");
+      return;
+    }
+
     // Register in-flight START so a quick-release STOP can be buffered (same pattern
     // as pendingGroupStart/pendingGroupStop for GROUP calls).
     const privateStartStopKey = `${msg.fromId}_${msg.toId}`;
@@ -830,6 +845,38 @@ export default class Client extends EventEmitter {
       this.clearOverlapMissedCallKeysByPrefix(`${ChannelType.PRIVATE}:${msg.fromId}:${msg.toId}:`);
       this.clearOverlapMissedCallKeysByPrefix(`${ChannelType.PRIVATE}:${msg.toId}:${msg.fromId}:`);
     }
+  }
+
+  /** Sends an OfflineMembers TEXT to the group-call caller with the list of PTT
+   *  numbers that were not connected. Caller uses this list to send wake-up pushes. */
+  private sendOfflineMembersText(
+    this: Client,
+    msg: IMessage,
+    offlinePttNos: numberOrString[]
+  ): void {
+    const pttNos = offlinePttNos.map((id) => id + "");
+    const offlineMsg = {
+      channelType: msg.channelType,
+      fromId: msg.toId,
+      messageId: JSON.stringify({
+        callId: msg.toId.toString(),
+        errorType: "Offline",
+        lang: "",
+        membersInCall: 0,
+        offlinePttNos: pttNos,
+        textMessageType: "OfflineMembers",
+        translate: false
+      }),
+      messageType: MessageType.TEXT,
+      payload: JSON.stringify({
+        message_id: "OfflineMembers",
+        text: JSON.stringify({ callId: msg.toId.toString(), offlinePttNos: pttNos })
+      }),
+      toId: msg.fromId
+    };
+    logger.info(`sendOfflineMembersText: notifying caller ${msg.fromId}` +
+                ` group ${msg.toId} offlineCount=${pttNos.length}`);
+    this.server.sendMessageToUser(offlineMsg, msg.fromId);
   }
 
   private sendOverlapMissedCallText(this: Client, msg: IMessage, recipientId: numberOrString): void {
@@ -1419,11 +1466,19 @@ export default class Client extends EventEmitter {
       Q.all(checkPromises).then((results) => {
         const availableRecipients: numberOrString[] = [];
         const overlapMissedRecipients: numberOrString[] = [];
+        const offlineRecipients: numberOrString[] = [];
         const overrides: Array<(done: () => void) => void> = [];
 
         results.forEach((res: any) => {
           if (!res) { return; }
           const { uid, details } = res;
+          // OFFLINE: member has no client record (app killed, Doze, lost socket).
+          // Collected so the caller can wake them via push instead of silently dropping
+          // them from the floor recipient list. Existing online members still get the call.
+          if (!this.server.isUserConnected(uid)) {
+            offlineRecipients.push(uid);
+            return;
+          }
           if (!details.inCall) {
             // Skip members who explicitly left this call session via DropCall,
             // UNLESS this is an SOS — emergencies reach everyone.
@@ -1524,6 +1579,13 @@ export default class Client extends EventEmitter {
               // Commit the recipients list and broadcast START to available members.
               States.setGroupFloorRecipients(msg.toId, msg.fromId, availableRecipients.map((r) => r + ""));
               this.server.sendMessageToGroupSubset(msg, availableRecipients);
+
+              // Notify caller about offline members so they can send wake-up pushes.
+              // Online members already hear the call; offline members will be reachable
+              // for the caller's next PTT once they wake up and re-register.
+              if (offlineRecipients.length > 0) {
+                this.sendOfflineMembersText(msg, offlineRecipients);
+              }
 
               // Process a buffered STOP so quick tap-and-release always sends START then STOP.
               // Delay by 400ms so the receiver has time to process the START before STOP arrives —
