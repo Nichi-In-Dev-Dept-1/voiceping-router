@@ -1568,8 +1568,8 @@ export default class Client extends EventEmitter {
 
         overlapMissedRecipients.forEach((uid) => this.sendOverlapMissedCallText(msg, uid));
 
-        // ── Step 2: If ALL members are busy, reject immediately — no floor acquired yet.
-        if (availableRecipients.length === 0 && overrides.length === 0) {
+        // ── Step 2: If ALL members are busy (and none offline), reject immediately — no floor acquired yet.
+        if (availableRecipients.length === 0 && overrides.length === 0 && offlineRecipients.length === 0) {
           this.pendingGroupStart.delete(startStopKey);
           this.pendingGroupStop.delete(startStopKey);
           logger.info(`handleGroupStartMessage: all members busy for group ${msg.toId}` +
@@ -1580,7 +1580,7 @@ export default class Client extends EventEmitter {
         }
 
         const acquireFloorAndProceed = () => {
-          // ── Step 3: At least one member is available — acquire the floor and proceed.
+          // ── Step 3: At least one member is available or offline — acquire the floor and proceed.
           this.acknowledgeGroupStartMessage(msg, (err, acknowledged) => {
             this.pendingGroupStart.delete(startStopKey);
 
