@@ -54,6 +54,10 @@ const groupFloorKeysByUser: { [userId: string]: Set<string> } = {};
 // Floor TTL: max call duration + a generous buffer (seconds).
 const PRIVATE_FLOOR_TTL_SEC = Math.ceil((config.group.busyTimeout / 1000) + 30);
 const GROUP_FLOOR_TTL_SEC   = Math.ceil((config.group.busyTimeout / 1000) + 30);
+// Short TTL for the per-target start-claim — it only guards the brief window
+// while a private START is being processed. Released explicitly once the START
+// outcome is decided; this TTL is just a self-healing backstop.
+const START_CLAIM_TTL_SEC = 10;
 
 export function privateFloorKey(userId1: numberOrString, userId2: numberOrString): string {
   const u1 = userId1 + "";
@@ -1132,6 +1136,40 @@ export default class States {
       }
       if (callback) { return callback(err || null, released || false); }
     });
+  }
+
+  /**
+   * Atomically claim a target user for a brand-new private call.
+   *
+   * The "is target busy?" check and the busy-set in handlePrivateStartMessage
+   * are not atomic, so two callers pressing PTT for the same target at the same
+   * moment can both pass the check and both connect. This Redis SET NX claim
+   * closes that window: only the first START wins, the rest are rejected with
+   * Busy. Cluster-safe — every Fargate task shares one Redis. It is a
+   * START-window lock only: released as soon as the START outcome is decided
+   * (call established or rejected); the real busy state takes over from there.
+   * Self-heals via START_CLAIM_TTL_SEC if a release is ever missed.
+   */
+  public static acquireStartClaim(
+    targetId: numberOrString,
+    requestingUserId: numberOrString,
+    callback: (err: Error, acquired: boolean) => void
+  ): void {
+    Redis.acquirePrivateFloor(
+      "startclaim_" + targetId,
+      requestingUserId + "",
+      START_CLAIM_TTL_SEC,
+      (err, acquired) => callback(err, acquired)
+    );
+  }
+
+  /** Release a start-claim. Atomic owner-check — a no-op if the caller does not hold it. */
+  public static releaseStartClaim(
+    targetId: numberOrString,
+    requestingUserId: numberOrString,
+    callback?: (err: Error, released: boolean) => void
+  ): void {
+    Redis.releasePrivateFloor("startclaim_" + targetId, requestingUserId + "", callback);
   }
 
   /**

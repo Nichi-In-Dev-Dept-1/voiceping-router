@@ -514,7 +514,24 @@ export default class Client extends EventEmitter {
             return;
           }
 
-          this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt);
+          // Fresh call — target is free. Atomically claim the target so two callers
+          // pressing PTT for it at the same instant cannot both pass: the Redis SET NX
+          // claim is atomic across all Fargate tasks. The loser is rejected with Busy.
+          // Released inside proceedWithPrivateStart once the outcome is decided.
+          States.acquireStartClaim(msg.toId, msg.fromId, (claimErr, claimed) => {
+            if (!claimed) {
+              logger.info(`handlePrivateStartMessage: target ${msg.toId} just claimed by a` +
+                          ` simultaneous caller — rejecting ${msg.fromId} with Busy`);
+              this.sendOverlapMissedCallText(msg, msg.toId);
+              this.message({
+                channelType: msg.channelType, fromId: msg.fromId,
+                messageType: MessageType.START_FAILED, payload: "Busy", toId: msg.toId
+              });
+              this.sendBusyEventText(msg, "Busy");
+              return;
+            }
+            this.proceedWithPrivateStart(msg, newCallIsSos, newCallIsInterrupt);
+          });
         });
       };
 
@@ -609,6 +626,7 @@ export default class Client extends EventEmitter {
             }
             logger.info(`handlePrivateStartMessage: floor busy for ${msg.fromId}→${msg.toId},` +
                         ` owner: ${currentOwner} — sending START_FAILED`);
+            States.releaseStartClaim(msg.toId, msg.fromId);
             this.message({
               channelType: msg.channelType,
               fromId: msg.fromId,
@@ -620,6 +638,7 @@ export default class Client extends EventEmitter {
         }
         logger.info(`handlePrivateStartMessage: floor busy for ${msg.fromId}→${msg.toId},` +
                     ` owner: ${currentOwner} — sending START_FAILED`);
+        States.releaseStartClaim(msg.toId, msg.fromId);
         this.message({
           channelType: msg.channelType,
           fromId: msg.fromId,
@@ -632,6 +651,8 @@ export default class Client extends EventEmitter {
       // Mark both users as in an active private call globally in Redis.
       States.setUserPrivateCall(msg.fromId, msg.toId, isSos);
       States.setUserPrivateCall(msg.toId, msg.fromId, isSos);
+      // Target's real busy state is now set — release the START-window claim.
+      States.releaseStartClaim(msg.toId, msg.fromId);
 
       Recorder.start(msg);
       this.acknowledgePrivateStartMessage(msg);
