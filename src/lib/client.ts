@@ -703,7 +703,13 @@ export default class Client extends EventEmitter {
         // Notify remaining group members of the reduced participant count.
         States.getActiveParticipantsOfGroup(groupId, (apErr, remaining) => {
           (remaining || []).forEach((pid) => {
-            if (pid.toString() !== userId.toString()) {
+            // Skip the overridden user (userId), and skip the caller that is
+            // initiating this override (this.id). The caller is starting a new
+            // SOS/override call on this same group — delivering it a plain
+            // DropCall (errorType="") makes its mobile run onDropOrEndCall and
+            // end its own SOS call before it ever connects.
+            if (pid.toString() !== userId.toString() &&
+                pid.toString() !== this.id.toString()) {
               this.sendDropCallToUser(userId + "", groupId, 2, count, pid, false);
             }
           });
@@ -1532,15 +1538,13 @@ export default class Client extends EventEmitter {
               availableRecipients.push(uid);
             }
           } else if (details.channelType === 2 && details.targetId === msg.toId.toString()) {
-            // Already in this same group call — include them.
+            // Already in this same group call — include them. For an SOS call to the
+            // SAME group, do NOT override: the member is already connected, so just
+            // deliver the SOS START. Its isSosCall flag upgrades the call to SOS in
+            // place on the receiver. Overriding here (DropCall → soft-reset →
+            // reconnect) was a fragile teardown that dropped the SOS audio and left
+            // the receivers disconnected until the caller pressed PTT again.
             availableRecipients.push(uid);
-            // Override only if the existing call is genuinely non-SOS. details.isSos can be
-            // stale (e.g. reset to false on reconnect) so also check groupSosState directly.
-            const memberGroupInSos = details.isSos || States.isGroupSos(details.targetId);
-            if (isSos && !memberGroupInSos) {
-              // SOS overrides a normal call even in the same group to ensure UI visibility.
-              overrides.push((done) => this.executeCallOverrideForUser(uid, details, done));
-            }
           } else if (isSos && !details.isSos && !States.isGroupSos(details.targetId)) {
             // SOS overrides a non-SOS call in a different channel.
             // Guard: also check groupSosState in case details.isSos is stale — don't eject
