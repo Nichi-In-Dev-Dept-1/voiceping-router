@@ -1170,9 +1170,11 @@ export default class Client extends EventEmitter {
     const earlyMeta = this.parseTextMessageMeta(msg);
     // The mobile app sends "DropCall" (not "EndCall") when a user ends a private call.
     // "EndCall" is sent by the router itself when forcibly terminating a call.
-    // Both must clear the private-call state so the peer is no longer seen as busy.
+    // Both (including BusyEvents) must clear private call state.
     if (earlyMeta && msg.channelType === 1 &&
-        (earlyMeta.textMessageType === "EndCall" || earlyMeta.textMessageType === "DropCall")) {
+        (earlyMeta.textMessageType === "EndCall" ||
+         earlyMeta.textMessageType === "DropCall" ||
+         earlyMeta.textMessageType === "BusyEvent")) {
       States.clearUserPrivateCall(msg.fromId);
       States.clearUserPrivateCall(msg.toId);
     }
