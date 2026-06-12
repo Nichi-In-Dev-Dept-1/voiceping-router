@@ -3,7 +3,7 @@ FROM node:8.16.0-alpine
 # Global dependencies
 RUN apk --no-cache add --virtual native-deps \
     g++ gcc libgcc libstdc++ linux-headers git make python bash openssh && \
-    npm install --quiet node-gyp -g
+    npm install --quiet node-gyp -g --unsafe-perm
 
 # App dependencies
 WORKDIR /app

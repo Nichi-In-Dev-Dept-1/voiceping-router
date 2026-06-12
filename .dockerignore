@@ -1,0 +1,9 @@
+.git
+.circleci
+node_modules
+dist
+npm-debug.log
+.env
+.env.*
+test
+README.md

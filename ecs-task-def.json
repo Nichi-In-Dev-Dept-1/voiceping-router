@@ -1,0 +1,44 @@
+{
+  "family": "voiceping-router",
+  "networkMode": "awsvpc",
+  "requiresCompatibilities": ["FARGATE"],
+  "cpu": "512",
+  "memory": "1024",
+  "executionRoleArn": "arn:aws:iam::807110418145:role/ecsTaskExecutionRole",
+  "containerDefinitions": [
+    {
+      "name": "voiceping-router",
+      "image": "807110418145.dkr.ecr.ap-northeast-1.amazonaws.com/voiceping-router:latest",
+      "essential": true,
+      "portMappings": [
+        {
+          "containerPort": 3000,
+          "hostPort": 3000,
+          "protocol": "tcp"
+        }
+      ],
+      "environment": [
+        {"name": "PORT", "value": "3000"},
+        {"name": "NODE_ENV", "value": "production"},
+        {"name": "REDIS_HOST", "value": "voiceping-router-redis.o4v5l5.0001.apne1.cache.amazonaws.com"},
+        {"name": "REDIS_PORT", "value": "6379"},
+        {"name": "SECRET_KEY", "value": "voiceping-secret-key-change-in-prod"}
+      ],
+      "logConfiguration": {
+        "logDriver": "awslogs",
+        "options": {
+          "awslogs-group": "/ecs/voiceping-router",
+          "awslogs-region": "ap-northeast-1",
+          "awslogs-stream-prefix": "ecs"
+        }
+      },
+      "healthCheck": {
+        "command": ["CMD-SHELL", "wget -qO- http://127.0.0.1:3000/ || exit 1"],
+        "interval": 30,
+        "timeout": 5,
+        "retries": 3,
+        "startPeriod": 20
+      }
+    }
+  ]
+}

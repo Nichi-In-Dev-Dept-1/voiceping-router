@@ -41,6 +41,14 @@ class Recorder {
   public start = (msg: IMessage)  => {
     if (msg.messageType !== MessageType.START) { return; }
     const currentFileName = util.format("%d_%d_%s_%s.opus", msg.channelType, MessageType.AUDIO, msg.toId, msg.fromId);
+
+    // Deduplication: if a recording session for this user-pair is already active,
+    // don't start a new one. This happens on START retries or silent re-acks.
+    if (this.recordStreamsSet[currentFileName]) {
+      debug(`Recorder.start: session already active for ${currentFileName} — ignoring duplicate`);
+      return;
+    }
+
     const filePath = path.resolve(this.uploadPath, "audio", currentFileName);
 
     const stream = fs.createWriteStream(filePath);
