@@ -259,7 +259,10 @@ export default class Client extends EventEmitter {
   private addToGroup(this: Client, groupId: numberOrString) {
     Redis.addUserToGroup(this.id, groupId, (err, succeed) => {
       Redis.getUsersInsideGroup(groupId, (err1, userIds) => {
-        States.setUsersInsideGroup(groupId, userIds);
+        if (err1) {
+          logger.info(`addToGroup: Redis error fetching group ${groupId} members: ${err1}`);
+        }
+        States.setUsersInsideGroup(groupId, userIds || []);
       });
     });
   }
@@ -267,7 +270,10 @@ export default class Client extends EventEmitter {
   private removeFromGroup(this: Client, groupId: numberOrString) {
     Redis.removeUserFromGroup(this.id, groupId, (err, succeed) => {
       Redis.getUsersInsideGroup(groupId, (err1, userIds) => {
-        States.setUsersInsideGroup(groupId, userIds);
+        if (err1) {
+          logger.info(`removeFromGroup: Redis error fetching group ${groupId} members: ${err1}`);
+        }
+        States.setUsersInsideGroup(groupId, userIds || []);
       });
     });
   }

@@ -143,7 +143,7 @@ export default class States {
     groupId: number|string, userIds: Array<number|string>,
     callback?: (err, succeed) => void) {
     groupId = groupId + "";
-    userIds = userIds.map((userId) => userId + "");
+    userIds = (userIds || []).map((userId) => userId + "");
     usersInsideGroupsSet[groupId] = userIds;
     if (!!memored) {
       memored.store(Keys.forUsersInsideGroup(groupId), userIds, function() {
@@ -173,7 +173,7 @@ export default class States {
         if (!err && userIds && userIds.length > 0) {
           usersInsideGroupsSet[groupId] = userIds;
         }
-        return callback(null, userIds);
+        return callback(null, userIds || []);
       });
     } else {
       memored.read(Keys.forUsersInsideGroup(groupId), function(err, userIds) {
